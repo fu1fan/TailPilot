@@ -11,7 +11,7 @@ done
 CGO_ENABLED=0 go build -trimpath -o "$out/bin/control" ./lab/g4-netns/control
 # Compare against an unmodified upstream client, never against a second fork.
 base=53a0d659afa51835dd7a9283873cca44261454f8
-git cat-file -e "$base^{commit}" 2>/dev/null || git fetch origin tag v1.102.3
+git show-ref --verify --quiet refs/tags/v1.102.3 || git fetch origin tag v1.102.3
 [[ $(git rev-parse 'v1.102.3^{}') == "$base" ]]
 stock=$(mktemp -d)
 trap 'rm -rf "$stock"' EXIT
