@@ -20,12 +20,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
-# No KVM, TUN, NET_ADMIN or SYS_ADMIN in the test process. Keep bind-service
+# No KVM, TUN, NET_ADMIN, NET_RAW or SYS_ADMIN in the test process. Keep bind-service
 # for the synthetic upstream on port 53; all control/DERP endpoints are loopback.
 run_case() {
   local name=$1
   shift
-  setpriv --bounding-set=-net_admin,-sys_admin --no-new-privs \
+  setpriv --bounding-set=-net_admin,-net_raw,-sys_admin --no-new-privs \
     env TAILPILOT_USERSPACE=1 R4_CLIENT_DAEMON="$build/bin/stock-tailscaled" \
       R33_SCALE_SEED_LEASES=0 "$@" \
     timeout --signal=TERM --kill-after=20s 1500s \

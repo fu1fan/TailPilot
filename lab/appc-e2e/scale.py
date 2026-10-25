@@ -542,8 +542,11 @@ try:
         wait_leases(1)
         old_ip='192.0.2.%d/32' % (int(hashlib.sha256(old_name.encode()).hexdigest()[:8],16)%250+1)
         policy_apply({'schema_version':2,'enabled':True,'dns_ipv4_only':{'enabled':True,'targets':TARGETS}},'reset-dns-only')
-        until(lambda: cli('debug','unified-policy','status','--json').get('runtimeReady'), 'handoff ready', 90)
+        # A compiled policy can be visible before the consumer completes TTL
+        # handoff. Do not clear routes while the previous consumer still owns them.
+        wait_generation_stable('reset-dns-only', seconds=3, timeout=90)
         cli('set','--advertise-routes=10.44.0.0/16','--advertise-exit-node=true')
+        assert old_ip not in (cli('debug','prefs').get('AdvertiseRoutes') or []), 'clear did not finish'
         daemon_svc.terminate()
         daemon_svc.archive()
         daemon_svc=DaemonService()

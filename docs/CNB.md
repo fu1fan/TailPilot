@@ -38,8 +38,13 @@ are required. Synthetic control, DERP and upstream DNS stay on loopback. The tes
 uses real tailscaled, SOCKS and PeerAPI HTTP/DNS; route assertions read actual
 advertised preferences and persisted TTL ownership.
 
+The CNB unit-test build tag `tailpilot_cnb_test` disables interface socket
+marking in LocalBackend tests, matching the real userspace daemon startup.
+Without it, upstream fake-engine tests fail on CNB with `SO_BINDTODEVICE: operation
+not permitted`. The tagged `_test.go` file never enters release binaries.
+
 The runtime needs container UID 0 because the unchanged policy reader requires
-root-owned files and ancestors. It drops NET_ADMIN and SYS_ADMIN before starting
+root-owned files and ancestors. It drops NET_ADMIN, NET_RAW and SYS_ADMIN before starting
 both daemons, uses userspace-networking, and never opens TUN or KVM. Binding the
 synthetic DNS on port 53 still needs bind-service capability on some kernels.
 
