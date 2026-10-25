@@ -5,11 +5,14 @@ branch/worktree for each upstream version. Record the exact tag object/peeled ba
 previous unified HEAD, Go distribution provenance, toolchain tree hash and module
 cache inventory. Do not replace dependency versions through `go get ...@latest`.
 
-Rebase each `unified:` commit and inspect `git range-diff`. Re-audit authoritative
+The public R6 baseline is a sanitized aggregate commit, not the private series
+of `unified:` commits. Use the [patch map](patch-map.md) and the full upstream
+diff to review that baseline. For subsequent feature commits, inspect
+`git range-diff` when replaying them. Re-audit authoritative
 prefs/owner barriers and authenticated receive before replay/handshake side effects;
 resolving textual conflicts is not sufficient. Preserve WireGuard licenses and
 follow `third_party/wireguard-go/PATCH.md` in a new dependency copy when authorized;
-regenerate/check its minimal patch and upstream hashes. R10 does not modify it.
+regenerate/check its minimal patch and upstream hashes.
 
 Run the required Go packages/full race plus the nested WireGuard module separately.
 Run shell syntax and all release/deploy/lab selftests, then isolated repeated builds.
@@ -29,6 +32,6 @@ rebase/test this patch set or roll back fully to official under the documented
 recovery procedure. Restore saved original update values only when appropriate;
 never assume all hosts originally had Apply=true or apt unheld.
 
-R10 deployment remains plan-only; native host adapter/ownership-aware restoration
-and power-loss acceptance must be completed before these plans can be operational.
+Deployment acceptance must be established for the current candidate and target
+host; historical implementation-stage notes do not establish that acceptance.
 See [deployment limitations](../deploy/README.md) and [release builder](../release/README.md).

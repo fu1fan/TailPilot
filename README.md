@@ -11,6 +11,8 @@ Original upstream licensing and attribution are retained below and in LICENSE.
 Development, userspace tests and candidate builds use the [CNB workflow](docs/CNB.md). Production deployment always requires an explicit operator action;
 ordinary pushes must never modify a tailnet or a production host.
 
+补丁维护入口：[功能与接入点索引](docs/patch-map.md)。
+
 ---
 
 # Tailscale

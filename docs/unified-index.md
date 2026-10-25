@@ -8,6 +8,6 @@
 - [Deployment plans, primitives and missing native adapter](../deploy/README.md)
 - [Maintenance/rebase](unified-maintenance.md)
 
-R10: audit regression fixed; release implementation has local static/dry-run tests;
-lab is a planning skeleton; deploy is not an operational executor. No native
-systemd, production or external E2E acceptance is implied by this index.
+Current public-source maintenance starts with the [patch map](patch-map.md) and
+[CNB workflow](CNB.md). Older documents may describe historical implementation
+stages; they are not evidence of current CI or production acceptance.
