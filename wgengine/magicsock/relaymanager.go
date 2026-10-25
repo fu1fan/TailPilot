@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"tailscale.com/disco"
+	"tailscale.com/featurepolicy"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/stun"
 	udprelay "tailscale.com/net/udprelay/endpoint"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 	"tailscale.com/util/set"
 )
@@ -317,6 +319,9 @@ func (r *relayManager) publishHasServersRunLoop() {
 }
 
 type relayDiscoMsgEvent struct {
+	verifiedSession    bool
+	terminalPeer       key.NodePublic
+	policyGeneration   uint64
 	conn               *Conn // for access to [Conn] if there is no associated [relayHandshakeWork]
 	msg                disco.Message
 	relayServerNodeKey key.NodePublic // nonzero if msg is a [*disco.AllocateUDPRelayEndpointResponse]
@@ -458,6 +463,7 @@ func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, lastBest addrQuality, 
 	relayManagerInputEvent(r, nil, &r.newServerEndpointCh, newRelayServerEndpointEvent{
 		wlb: endpointWithLastBest{
 			ep:                ep,
+			policyGeneration:  ep.c.pathGeneration(),
 			lastBest:          lastBest,
 			lastBestIsTrusted: lastBestIsTrusted,
 		},
@@ -471,8 +477,28 @@ func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, lastBest addrQuality, 
 // [*disco.AllocateUDPRelayEndpointResponse] then relayServerNodeKey must be
 // nonzero.
 func (r *relayManager) handleRxDiscoMsg(conn *Conn, dm disco.Message, relayServerNodeKey key.NodePublic, discoKey key.DiscoPublic, src epAddr) {
+	var terminal key.NodePublic
+	if ping, ok := dm.(*disco.Ping); ok {
+		terminal, _ = conn.unambiguousNodeKeyOfPingLocked(ping, discoKey, key.NodePublic{})
+	}
+	verified := false
+	if conn.pathEnabled() && !terminal.IsZero() {
+		if ep, ok := conn.peerMap.endpointForNodeKey(terminal); ok {
+			ep.mu.Lock()
+			candidate := ep.policyCandidates[featurepolicy.PeerRelay]
+			if conn.pathPeer(terminal) == nil {
+				candidate = ep.bestAddr
+				candidate.policyTrustUntil = ep.trustBestAddrUntil
+			}
+			verified = candidate.epAddr == src && candidate.relaySession != 0 && mono.Now().Before(candidate.policyTrustUntil)
+			ep.mu.Unlock()
+		}
+	}
 	relayManagerInputEvent(r, nil, &r.rxDiscoMsgCh, relayDiscoMsgEvent{
+		verifiedSession:    verified,
 		conn:               conn,
+		terminalPeer:       terminal,
+		policyGeneration:   conn.pathGeneration(),
 		msg:                dm,
 		relayServerNodeKey: relayServerNodeKey,
 		disco:              discoKey,
@@ -533,6 +559,7 @@ func relayManagerInputEvent[T any](r *relayManager, ctx context.Context, eventCh
 // the last bestAddr was trusted (see endpoint.trustBestAddrUntil) at the time
 // of init. This structure is immutable once initialized.
 type endpointWithLastBest struct {
+	policyGeneration  uint64
 	ep                *endpoint
 	lastBest          addrQuality
 	lastBestIsTrusted bool
@@ -543,6 +570,7 @@ type endpointWithLastBest struct {
 func (r *relayManager) startUDPRelayPathDiscoveryFor(ep *endpoint, lastBest addrQuality, lastBestIsTrusted bool) {
 	relayManagerInputEvent(r, nil, &r.startDiscoveryCh, endpointWithLastBest{
 		ep:                ep,
+		policyGeneration:  ep.c.pathGeneration(),
 		lastBest:          lastBest,
 		lastBestIsTrusted: lastBestIsTrusted,
 	})
@@ -600,6 +628,9 @@ func (r *relayManager) handleRxDiscoMsgRunLoop(event relayDiscoMsgEvent) {
 			// No outstanding work tied to these disco keys, discard.
 			return
 		}
+		if !allocWork.wlb.policyAllowed() || !allocWork.wlb.acceptsGeneration(event.policyGeneration) {
+			return
+		}
 		select {
 		case done := <-allocWork.doneCh:
 			// allocateServerEndpoint returned, clean up its state
@@ -612,6 +643,13 @@ func (r *relayManager) handleRxDiscoMsgRunLoop(event relayDiscoMsgEvent) {
 		work, ok = r.handshakeWorkByServerDiscoVNI[serverDiscoVNI{event.disco, event.vni}]
 		if !ok {
 			// No outstanding work tied to this challenge, discard.
+			return
+		}
+		if !work.wlb.policyAllowed() || !work.wlb.acceptsGeneration(event.policyGeneration) {
+			return
+		}
+		terminalDisco := work.wlb.ep.disco.Load()
+		if terminalDisco == nil || msg.RemoteKey != terminalDisco.key || msg.VNI != work.se.VNI {
 			return
 		}
 		_, ok = r.handshakeWorkAwaitingPong[work]
@@ -645,24 +683,46 @@ func (r *relayManager) handleRxDiscoMsgRunLoop(event relayDiscoMsgEvent) {
 		// disabled by default.
 		vni := packet.VirtualNetworkID{}
 		vni.Set(event.vni)
-		go event.conn.sendDiscoMessage(epAddr{ap: event.from, vni: vni}, key.NodePublic{}, event.disco, &disco.Pong{
-			TxID: msg.TxID,
-			Src:  event.from,
-		}, discoVerboseLog)
-
 		work, ok = r.addrPortVNIToHandshakeWork[apv]
-		if !ok {
-			// No outstanding work tied to this [addrPortVNI], return early.
+		var policy pathSendContext
+		if ok {
+			terminal := work.wlb.ep.disco.Load()
+			if terminal == nil || terminal.key != event.disco || (!event.terminalPeer.IsZero() && event.terminalPeer != work.wlb.ep.publicKey) {
+				return
+			}
+			policy = work.sendContext()
+		} else {
+			// A completed session can still receive peer Ping. Resolve its
+			// terminal identity through the control map, never the relay server.
+			if event.conn.pathEnabled() && (event.terminalPeer.IsZero() || !event.verifiedSession) {
+				return
+			}
+			policy = pathSendContext{peer: event.terminalPeer, generation: event.policyGeneration, purpose: featurepolicy.PathProbe}
+		}
+		if !event.conn.allowPathSend(policy, featurepolicy.PeerRelay) {
 			return
 		}
+		go event.conn.sendDiscoMessagePolicy(epAddr{ap: event.from, vni: vni}, key.NodePublic{}, event.disco, &disco.Pong{TxID: msg.TxID, Src: event.from}, discoVerboseLog, policy)
+		if !ok {
+			return
+		}
+
 	case *disco.Pong:
 		work, ok = r.addrPortVNIToHandshakeWork[apv]
 		if !ok {
 			// No outstanding work tied to this [addrPortVNI], discard.
 			return
 		}
+		terminal := work.wlb.ep.disco.Load()
+		if terminal == nil || terminal.key != event.disco {
+			return
+		}
+
 	default:
 		// Unexpected message type, discard.
+		return
+	}
+	if !work.wlb.policyAllowed() || !work.wlb.acceptsGeneration(event.policyGeneration) {
 		return
 	}
 	select {
@@ -697,7 +757,7 @@ func (r *relayManager) handleAllocWorkDoneRunLoop(done relayEndpointAllocWorkDon
 	if len(byDiscoKeys) == 0 {
 		delete(r.allocWorkByDiscoKeysByServerNodeKey, done.work.candidatePeerRelay.nodeKey)
 	}
-	if !done.allocated.ServerDisco.IsZero() {
+	if done.work.wlb.policyAllowed() && !done.allocated.ServerDisco.IsZero() {
 		r.handleNewServerEndpointRunLoop(newRelayServerEndpointEvent{
 			wlb:    done.work.wlb,
 			se:     done.allocated,
@@ -725,7 +785,7 @@ func (r *relayManager) handleHandshakeWorkDoneRunLoop(done relayEndpointHandshak
 		delete(r.handshakeWorkAwaitingPong, work)
 		delete(r.addrPortVNIToHandshakeWork, apv)
 	}
-	if !done.pongReceivedFrom.IsValid() {
+	if !done.work.wlb.policyAllowed() || !done.pongReceivedFrom.IsValid() {
 		// The handshake or ping/pong probing timed out.
 		return
 	}
@@ -736,15 +796,25 @@ func (r *relayManager) handleHandshakeWorkDoneRunLoop(done relayEndpointHandshak
 	// ep.udpRelayEndpointReady() must be called in a new goroutine to prevent
 	// deadlocks as it acquires [endpoint] & [Conn] mutexes. See [relayManager]
 	// docs for details.
+	var relaySession uint64
+	if done.work.wlb.ep.c.authenticatedPathGate.Load() != nil {
+		relaySession = uint64(done.work.handshakeGen)
+	}
 	go done.work.wlb.ep.udpRelayEndpointReady(addrQuality{
-		epAddr:           addr,
-		relayServerDisco: done.work.se.ServerDisco,
-		latency:          done.latency,
-		wireMTU:          pingSizeToPktLen(0, addr),
+		relaySession:        relaySession,
+		policyRelayLifetime: done.work.se.SteadyStateLifetime.Duration,
+		policyGeneration:    done.work.wlb.policyGeneration,
+		epAddr:              addr,
+		relayServerDisco:    done.work.se.ServerDisco,
+		latency:             done.latency,
+		wireMTU:             pingSizeToPktLen(0, addr),
 	})
 }
 
 func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelayServerEndpointEvent) {
+	if !newServerEndpoint.wlb.policyAllowed() {
+		return
+	}
 	// Check for duplicate work by server disco + VNI.
 	sdv := serverDiscoVNI{newServerEndpoint.se.ServerDisco, newServerEndpoint.se.VNI}
 	existingWork, ok := r.handshakeWorkByServerDiscoVNI[sdv]
@@ -787,7 +857,7 @@ func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelay
 	if newServerEndpoint.server.isValid() {
 		// Send a [disco.CallMeMaybeVia] to the remote peer if we allocated this
 		// endpoint, regardless of if we start a handshake below.
-		go r.sendCallMeMaybeVia(newServerEndpoint.wlb.ep, newServerEndpoint.se)
+		go r.sendCallMeMaybeViaPolicy(newServerEndpoint.wlb, newServerEndpoint.se)
 	}
 
 	lastBestMatchingServerVNI := newServerEndpoint.wlb.lastBest.vni.IsSet() &&
@@ -851,6 +921,13 @@ func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelay
 //  1. it acquires ep.mu (refer to [relayManager] docs for reasoning)
 //  2. it makes a networking syscall, which can introduce unwanted backpressure
 func (r *relayManager) sendCallMeMaybeVia(ep *endpoint, se udprelay.ServerEndpoint) {
+	r.sendCallMeMaybeViaPolicy(endpointWithLastBest{ep: ep, policyGeneration: ep.c.pathGeneration()}, se)
+}
+func (r *relayManager) sendCallMeMaybeViaPolicy(wlb endpointWithLastBest, se udprelay.ServerEndpoint) {
+	if !wlb.policyAllowed() {
+		return
+	}
+	ep := wlb.ep
 	ep.mu.Lock()
 	derpAddr := ep.derpAddr
 	ep.mu.Unlock()
@@ -869,7 +946,7 @@ func (r *relayManager) sendCallMeMaybeVia(ep *endpoint, se udprelay.ServerEndpoi
 			AddrPorts:           se.AddrPorts,
 		},
 	}
-	ep.c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, epDisco.key, callMeMaybeVia, discoVerboseLog)
+	ep.c.sendDiscoMessagePolicy(epAddr{ap: derpAddr}, ep.publicKey, epDisco.key, callMeMaybeVia, discoVerboseLog, wlb.sendContext())
 }
 
 func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
@@ -907,7 +984,7 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 	for _, addrPort := range work.se.AddrPorts {
 		if addrPort.IsValid() {
 			sentBindAny = true
-			go ep.c.sendDiscoMessage(epAddr{ap: addrPort, vni: vni}, key.NodePublic{}, work.se.ServerDisco, bind, discoVerboseLog)
+			go ep.c.sendDiscoMessagePolicy(epAddr{ap: addrPort, vni: vni}, key.NodePublic{}, work.se.ServerDisco, bind, discoVerboseLog, work.sendContext())
 		}
 	}
 	if !sentBindAny {
@@ -918,7 +995,7 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 	// detached and independent of 'BindLifetime' to prevent relay server
 	// (mis)configuration from negatively impacting client resource usage.
 	const maxHandshakeLifetime = time.Second * 30
-	timer := time.NewTimer(min(work.se.BindLifetime.Duration, maxHandshakeLifetime))
+	timer := time.NewTimer(work.wlb.policyTimeout(min(work.se.BindLifetime.Duration, maxHandshakeLifetime)))
 	defer timer.Stop()
 
 	// Limit the number of pings we will transmit. Inbound pings trigger
@@ -944,9 +1021,9 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 			if withAnswer != nil {
 				answer := &disco.BindUDPRelayEndpointAnswer{BindUDPRelayEndpointCommon: common}
 				answer.Challenge = *withAnswer
-				ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, work.se.ServerDisco, answer, discoVerboseLog)
+				ep.c.sendDiscoMessagePolicy(epAddr{ap: to, vni: vni}, key.NodePublic{}, work.se.ServerDisco, answer, discoVerboseLog, work.sendContext())
 			}
-			ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, epDisco.key, ping, discoVerboseLog)
+			ep.c.sendDiscoMessagePolicy(epAddr{ap: to, vni: vni}, key.NodePublic{}, epDisco.key, ping, discoVerboseLog, work.sendContext())
 		}()
 	}
 
@@ -968,6 +1045,9 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 			work.dlogf("[v1] magicsock: relayManager: handshake canceled")
 			return
 		case msgEvent := <-work.rxDiscoMsgCh:
+			if !work.wlb.policyAllowed() || !work.wlb.acceptsGeneration(msgEvent.policyGeneration) {
+				return
+			}
 			switch msg := msgEvent.msg.(type) {
 			case *disco.BindUDPRelayEndpointChallenge:
 				err := validateVNIAndRemoteKey(msg.BindUDPRelayEndpointCommon)
@@ -1039,20 +1119,20 @@ func (r *relayManager) allocateServerEndpoint(work *relayEndpointAllocWork) {
 	}
 
 	sendAllocReq := func() {
-		work.wlb.ep.c.sendDiscoAllocateUDPRelayEndpointRequest(
+		work.wlb.ep.c.sendDiscoAllocateUDPRelayEndpointRequestPolicy(
 			epAddr{
 				ap: netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, work.candidatePeerRelay.derpHomeRegionID),
 			},
 			work.candidatePeerRelay.nodeKey,
 			work.candidatePeerRelay.discoKey,
 			dm,
-			discoVerboseLog,
+			discoVerboseLog, work.sendContext(),
 		)
 		work.dlogf("[v1] magicsock: relayManager: sent alloc request")
 	}
 	go sendAllocReq()
 
-	returnAfterTimer := time.NewTimer(allocateUDPRelayEndpointRequestTimeout)
+	returnAfterTimer := time.NewTimer(work.wlb.policyTimeout(allocateUDPRelayEndpointRequestTimeout))
 	defer returnAfterTimer.Stop()
 	// While connections to DERP are over TCP, they can be lossy on the DERP
 	// server when data moves between the two independent streams. Also, the
@@ -1092,6 +1172,9 @@ func (r *relayManager) allocateServerEndpoint(work *relayEndpointAllocWork) {
 }
 
 func (r *relayManager) allocateAllServersRunLoop(wlb endpointWithLastBest) {
+	if !wlb.policyAllowed() {
+		return
+	}
 	if len(r.serversByNodeKey) == 0 {
 		return
 	}
@@ -1136,4 +1219,33 @@ func (r *relayManager) allocateAllServersRunLoop(wlb endpointWithLastBest) {
 		started.allocGen = r.allocGeneration
 		go r.allocateServerEndpoint(started)
 	}
+}
+
+func (w endpointWithLastBest) policyAllowed() bool {
+	return w.ep.c.decidePath(w.ep.publicKey, featurepolicy.PeerRelay, featurepolicy.PathProbe, w.policyGeneration)
+}
+func (w endpointWithLastBest) sendContext() pathSendContext {
+	return pathSendContext{peer: w.ep.publicKey, generation: w.policyGeneration, purpose: featurepolicy.PathProbe, relayWork: true}
+}
+
+func (w endpointWithLastBest) acceptsGeneration(g uint64) bool {
+	return w.policyAllowed() && w.ep.c.decidePath(w.ep.publicKey, featurepolicy.PeerRelay, featurepolicy.PathProbe, g)
+}
+
+func (w endpointWithLastBest) policyTimeout(upstream time.Duration) time.Duration {
+	if w.ep.c != nil && w.ep.c.pathPeer(w.ep.publicKey) != nil {
+		return min(upstream, time.Duration(w.ep.c.pathTimeoutSeconds.Load())*time.Second)
+	}
+	return upstream
+}
+
+func (w *relayHandshakeWork) sendContext() pathSendContext {
+	p := w.wlb.sendContext()
+	p.workContext = w.ctx
+	return p
+}
+func (w *relayEndpointAllocWork) sendContext() pathSendContext {
+	p := w.wlb.sendContext()
+	p.workContext = w.ctx
+	return p
 }

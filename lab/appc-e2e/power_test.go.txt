@@ -1,0 +1,150 @@
+package ipnlocal
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"syscall"
+	"testing"
+
+	"tailscale.com/appc"
+	"tailscale.com/ipn"
+)
+
+// Hook only exists in the test overlay. Persisted snapshots model a completed
+// StateStore write, not FileStore/fsync or systemd. Children are actual SIGKILLed
+// processes; no production binary has fault-injection code.
+var r26Dir string
+var r26Cut, r26Writes int
+var r26After bool
+
+func r26StoreHook(s *connectorDaemonStore, after bool) {
+	if r26Dir == "" {
+		return
+	}
+	if !after {
+		r26Writes++
+	}
+	if after {
+		raw, err := s.Store.ExportToJSON()
+		if err != nil {
+			panic(err)
+		}
+		path := filepath.Join(r26Dir, "durable.json")
+		f, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		if err != nil {
+			panic(err)
+		}
+		if _, err = f.Write(raw); err != nil {
+			panic(err)
+		}
+		if err = f.Sync(); err != nil {
+			panic(err)
+		}
+		if err = f.Close(); err != nil {
+			panic(err)
+		}
+		if err = os.Rename(path+".tmp", path); err != nil {
+			panic(err)
+		}
+	}
+	if r26Writes == r26Cut && after == r26After {
+		_ = os.WriteFile(filepath.Join(r26Dir, "barrier"), []byte(fmt.Sprint(r26Writes, after)), 0600)
+		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		panic("SIGKILL returned")
+	}
+}
+func TestR26ProcessPowerCuts(t *testing.T) {
+	if mode := os.Getenv("R26_CHILD"); mode != "" {
+		b, r, st := newConnectorDaemon(t, 0)
+		dir := os.Getenv("R26_CASE")
+		if mode == "cut" {
+			prefs := b.pm.prefs.AsStruct()
+			prefs.Hostname = "r26-identity-sentinel"
+			prefs.AdvertiseRoutes = append(prefs.AdvertiseRoutes, prefix("203.0.113.0/24"), prefix("0.0.0.0/0"), prefix("::/0"))
+			b.pm.prefs = prefs.View()
+			mustTakeover(t, st.WriteState("profile-p", prefs.ToBytes()))
+			mustTakeover(t, r.connector.ObserveDNSResponse(takeoverWire(t, "www.example.test", [4]byte{192, 0, 2, 7})))
+			_, req := daemonPreview(t, b, r, "appc-route-reset", UnifiedDebugRequest{Source: "r26-power"})
+			raw, e := st.Store.ExportToJSON()
+			mustTakeover(t, e)
+			mustTakeover(t, os.WriteFile(filepath.Join(dir, "durable.json"), raw, 0600))
+			r26Cut, _ = strconv.Atoi(os.Getenv("R26_CUT"))
+			r26After = os.Getenv("R26_AFTER") == "true"
+			r26Dir = dir
+			_, e = b.connectorAction(r, "appc-route-reset", req)
+			t.Fatalf("cut barrier not reached: %v", e)
+		}
+		raw, e := os.ReadFile(filepath.Join(dir, "durable.json"))
+		mustTakeover(t, e)
+		mustTakeover(t, st.Store.LoadFromJSON(raw))
+		raw, e = st.ReadState("profile-p")
+		mustTakeover(t, e)
+		prefs := ipn.NewPrefs()
+		mustTakeover(t, ipn.PrefsFromBytes(raw, prefs))
+		b.pm.prefs = prefs.View()
+		b.appConnector.Close()
+		b.appConnector = appc.NewAppConnector(appc.Config{SourceID: 100, Logf: t.Logf, EventBus: b.sys.Bus.Get()})
+		t.Cleanup(b.appConnector.Close)
+		r.connector = nil
+		r.connectorAdapter = nil
+		mustTakeover(t, b.reconcileUnifiedOwnerConsumer(r, r.manager.Current()))
+		want := []string{"0.0.0.0/0", "::/0", "203.0.113.0/24"}
+		if os.Getenv("R26_CUT") == "1" && os.Getenv("R26_AFTER") == "false" {
+			want = append(want, "192.0.2.7/32")
+		}
+		var got []string
+		for _, p := range b.Prefs().AdvertiseRoutes().All() {
+			got = append(got, p.String())
+		}
+		slices.Sort(got)
+		slices.Sort(want)
+		if !slices.Equal(got, want) || b.Prefs().Hostname() != "r26-identity-sentinel" {
+			t.Fatalf("recovery prefs=%v", b.Prefs())
+		}
+		v, e := readConnectorIntent(st, "profile-p")
+		mustTakeover(t, e)
+		if !v.Complete {
+			t.Fatal("partial journal after recovery")
+		}
+		raw, e = json.MarshalIndent(v, "", "  ")
+		mustTakeover(t, e)
+		mustTakeover(t, os.WriteFile(filepath.Join(dir, "recovered-journal.json"), raw, 0600))
+		return
+	}
+	root := os.Getenv("R26_POWER_OUT")
+	if root == "" {
+		root = t.TempDir()
+	}
+	for n := 1; n <= 6; n++ {
+		for _, after := range []bool{false, true} {
+			t.Run(fmt.Sprintf("write-%d-after-%t", n, after), func(t *testing.T) {
+				dir := filepath.Join(root, fmt.Sprintf("write-%d-after-%t", n, after))
+				mustTakeover(t, os.MkdirAll(dir, 0700))
+				run := func(mode string) ([]byte, error) {
+					c := exec.Command(os.Args[0], "-test.run=^TestR26ProcessPowerCuts$", "-test.v")
+					c.Env = append(os.Environ(), "R26_CHILD="+mode, "R26_CASE="+dir, fmt.Sprintf("R26_CUT=%d", n), fmt.Sprintf("R26_AFTER=%t", after))
+					return c.CombinedOutput()
+				}
+				out, e := run("cut")
+				_ = os.WriteFile(filepath.Join(dir, "cut.log"), out, 0600)
+				ee, ok := e.(*exec.ExitError)
+				if !ok || ee.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+					t.Fatalf("not SIGKILL: %v %s", e, out)
+				}
+				if _, e := os.Stat(filepath.Join(dir, "barrier")); e != nil {
+					t.Fatal(e)
+				}
+				out, e = run("recover")
+				_ = os.WriteFile(filepath.Join(dir, "recover.log"), out, 0600)
+				if e != nil {
+					t.Fatalf("recovery: %v %s", e, out)
+				}
+			})
+		}
+	}
+}

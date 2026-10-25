@@ -804,6 +804,7 @@ func (f forTest) TailnetLockKeyTrusted(keyID tkatype.KeyID) bool {
 // TKA from being initialized locally in future.
 func (b *LocalBackend) TailnetLockForceLocalDisable() error {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	if b.tka == nil {
 		return errTailnetLockNotActive

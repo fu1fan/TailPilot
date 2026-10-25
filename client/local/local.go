@@ -1723,3 +1723,17 @@ func (lc *Client) GetServices(ctx context.Context) (map[tailcfg.ServiceName]tail
 	}
 	return decodeJSON[map[tailcfg.ServiceName]tailcfg.ServiceDetails](body)
 }
+
+// DebugActionJSON invokes an unstable debug action with a JSON request and
+// returns its raw JSON response. It does not add a new LocalAPI endpoint.
+func (lc *Client) DebugActionJSON(ctx context.Context, action string, request any) (json.RawMessage, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	body, err := lc.send(ctx, "POST", "/localapi/v0/debug?action="+url.QueryEscape(action), 200, bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("debug action: %w: %s", err, body)
+	}
+	return json.RawMessage(body), nil
+}

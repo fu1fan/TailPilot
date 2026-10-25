@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tailscale-unified:policy:v2",
+  "title": "Unified policy configuration v2",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 2,
+      "type": "integer"
+    },
+    "machine": {
+      "type": "string",
+      "maxLength": 64,
+      "default": ""
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "reload_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60,
+      "default": 2
+    },
+    "auto_ipv6": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "publish": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "dns_ipv4_only": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          },
+          "maxItems": 256,
+          "uniqueItems": true,
+          "default": []
+        },
+        "negative_ttl_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300,
+          "default": 30
+        },
+        "dnssec_mode": {
+          "type": "string",
+          "default": "local-policy",
+          "enum": [
+            "local-policy"
+          ]
+        },
+        "max_chain_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 16
+        },
+        "local_route_wait_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2000,
+          "default": 1000
+        }
+      },
+      "additionalProperties": false
+    },
+    "path_policy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "stable_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "maxItems": 64,
+                "uniqueItems": true,
+                "default": []
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^tag:[a-zA-Z0-9_-]+$",
+                  "maxLength": 128
+                },
+                "maxItems": 16,
+                "uniqueItems": true,
+                "default": []
+              },
+              "allow": {
+                "type": "object",
+                "properties": {
+                  "direct": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "peer_relay": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "derp": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "direct",
+                  "peer_relay",
+                  "derp"
+                ]
+              },
+              "prefer": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "direct",
+                    "peer_relay",
+                    "derp"
+                  ]
+                },
+                "maxItems": 3,
+                "uniqueItems": true,
+                "default": []
+              },
+              "fallback": {
+                "type": "string",
+                "default": "allowed",
+                "enum": [
+                  "strict",
+                  "allowed"
+                ]
+              },
+              "allow_blackhole": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "allow",
+              "prefer"
+            ]
+          },
+          "maxItems": 256,
+          "uniqueItems": true,
+          "default": []
+        },
+        "probe_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60,
+          "default": 10
+        },
+        "probe_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        },
+        "failure_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        },
+        "recovery_successes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        },
+        "recovery_hold_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120,
+          "default": 15
+        },
+        "cooldown_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300,
+          "default": 30
+        }
+      },
+      "additionalProperties": false
+    },
+    "observability": {
+      "type": "object",
+      "properties": {
+        "log_decisions": {
+          "type": "boolean",
+          "default": true
+        },
+        "log_rate_per_minute": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 30
+        }
+      },
+      "additionalProperties": false
+    },
+    "app_connector_ttl": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "activity_mode": {
+          "type": "string",
+          "default": "bounded",
+          "enum": [
+            "off",
+            "bounded"
+          ]
+        },
+        "migration": {
+          "type": "string",
+          "default": "protect",
+          "enum": [
+            "protect"
+          ]
+        },
+        "ttl_cap_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 604800,
+          "default": 86400
+        },
+        "grace_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600,
+          "default": 120
+        },
+        "sweep_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 30
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "default": 128
+        },
+        "jitter_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30,
+          "default": 5
+        },
+        "min_advertise_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300,
+          "default": 30
+        },
+        "max_active_retention_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400,
+          "default": 3600
+        },
+        "udp_idle_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 600,
+          "default": 120
+        },
+        "clock_jump_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "default": 300
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 100000,
+          "default": 20000
+        },
+        "max_flow_entries": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 200000,
+          "default": 40000
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version"
+  ]
+}

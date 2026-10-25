@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http/httpguts"
+	"tailscale.com/appc"
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
@@ -776,13 +777,41 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Some timeout that's short enough to be noticed by humans
-	// but long enough that it's longer than real DNS timeouts.
+	// Cooperative processing budget after request parsing. Backend mutex waits,
+	// legacy synchronous storage and resolvers ignoring ctx can exceed it.
+	// This is not a hard end-to-end HTTP wall-time ceiling.
 	const arbitraryTimeout = 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(r.Context(), arbitraryTimeout)
 	defer cancel()
-	res, err := h.ps.resolver.HandlePeerDNSQuery(ctx, q, h.remoteAddr, h.ps.b.allowExitNodeDNSProxyToServeName)
+	var result appc.DNSPolicyResult
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		policy, valid, capturedObserver := h.ps.b.captureUnifiedDNS(ctx)
+		var observe func([]byte) error
+		if buildfeatures.HasAppConnectors && h.ps.b.OfferingAppConnector() {
+			observe = h.ps.b.ObserveDNSResponse
+			if capturedObserver != nil {
+				observe = capturedObserver
+			}
+		}
+		result, err = processUnifiedDNS(ctx, q, policy, valid, observe, func(ctx context.Context, query []byte) ([]byte, error) {
+			return h.ps.resolver.HandlePeerDNSQuery(ctx, query, h.remoteAddr, h.ps.b.allowExitNodeDNSProxyToServeName)
+		})
+		if !errors.Is(err, errUnifiedDNSStaleCapture) {
+			break
+		}
+		if attempt == 0 {
+			metricUnifiedDNSStaleRetry.Add(1)
+			h.ps.b.waitUnifiedDNSReady(ctx)
+			continue
+		}
+		// A second capture is still stale: keep the fail-closed managed answer.
+		metricUnifiedDNSStaleFinal.Add(1)
+		metricUnifiedDNSFailure.Add(1)
+		err = nil
+	}
+	res := result.Wire
 	if err != nil {
 		h.logf("handleDNS fwd error: %v", err)
 		if err := ctx.Err(); err != nil {
@@ -792,15 +821,8 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 		}
 		return
 	}
-	// TODO(raggi): consider pushing the integration down into the resolver
-	// instead to avoid re-parsing the DNS response for improved performance in
-	// the future.
-	if buildfeatures.HasAppConnectors && h.ps.b.OfferingAppConnector() {
-		if err := h.ps.b.ObserveDNSResponse(res); err != nil {
-			h.logf("ObserveDNSResponse error: %v", err)
-			// This is not fatal, we probably just failed to parse the upstream
-			// response. Return it to the caller anyway.
-		}
+	if result.CacheControl != "" {
+		w.Header().Set("Cache-Control", result.CacheControl)
 	}
 
 	if pretty {

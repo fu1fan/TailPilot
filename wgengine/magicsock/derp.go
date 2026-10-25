@@ -19,6 +19,7 @@ import (
 	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/featurepolicy"
 	"tailscale.com/health"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netcheck"
@@ -672,6 +673,7 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
 }
 
 type derpWriteRequest struct {
+	policy  pathSendContext
 	addr    netip.AddrPort
 	pubKey  key.NodePublic
 	b       []byte // copied; ownership passed to receiver
@@ -693,6 +695,9 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 		case <-ctx.Done():
 			return
 		case wr := <-ch:
+			if !c.allowPathSend(wr.policy, featurepolicy.DERP) {
+				continue
+			}
 			err := dc.Send(wr.pubKey, wr.b)
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
@@ -715,6 +720,7 @@ func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint)
 	}
 
 	for dm := range c.derpRecvCh {
+		ingressGeneration := c.pathGeneration()
 		if c.isClosed() {
 			break
 		}
@@ -725,6 +731,21 @@ func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		sizes[0] = n
 		eps[0] = ep
+		if gate := c.authenticatedPathGate.Load(); gate != nil {
+			generation := gate.generation
+			if gate.livePolicy {
+				generation = ingressGeneration
+			}
+			eps[0] = &authenticatedEndpoint{
+				Endpoint: ep, c: c.Conn, gate: gate,
+				context: conn.TransportContext{Kind: conn.TransportDERP,
+					Endpoint:   netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(dm.regionID)),
+					DERPRegion: dm.regionID, DERPSource: dm.src.Raw32(), Generation: generation},
+			}
+			if gate.livePolicy && !c.pathEnabled() {
+				eps[0] = &policyPassthroughEndpoint{authenticatedEndpoint: eps[0].(*authenticatedEndpoint)}
+			}
+		}
 		return 1, nil
 	}
 	return 0, net.ErrClosed
@@ -765,7 +786,15 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 		return 0, nil
 	}
 
-	ep.noteRecvActivity(srcAddr, mono.Now())
+	if gate := c.authenticatedPathGate.Load(); gate == nil {
+		ep.noteRecvActivity(srcAddr, mono.Now())
+	} else if gate.livePolicy {
+		c.mu.Lock()
+		if !c.pathEnabled() {
+			ep.noteRecvActivity(srcAddr, mono.Now())
+		}
+		c.mu.Unlock()
+	}
 	if update := c.connCounter.Load(); update != nil {
 		update(0, netip.AddrPortFrom(ep.nodeAddr, 0), srcAddr.ap, 1, dm.n, true)
 	}

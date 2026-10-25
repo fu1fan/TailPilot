@@ -88,6 +88,11 @@ func (pm *profileManager) dlogf(format string, args ...any) {
 }
 
 func (pm *profileManager) WriteState(id ipn.StateKey, val []byte) error {
+	// Unified authority is written only by the fenced coordinator, never by
+	// ordinary profile/prefs multi-key persistence (including Start).
+	if strings.Contains(string(id), "||_unified") {
+		return fmt.Errorf("profile writer cannot overwrite unified authority")
+	}
 	return ipn.WriteState(pm.store, id, val)
 }
 

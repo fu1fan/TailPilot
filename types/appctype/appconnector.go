@@ -81,6 +81,8 @@ type AppConnectorAttr struct {
 // so that we can know, even after a restart, which routes came from ACLs and which were
 // learned from domains.
 type RouteInfo struct {
+	SourceID    uint64 `json:"-"`
+	SourceEpoch uint64 `json:"-"`
 	// Control is the routes from the 'routes' section of an app connector acl.
 	Control []netip.Prefix `json:",omitempty"`
 	// Domains are the routes discovered by observing DNS lookups for configured domains.
@@ -93,6 +95,8 @@ type RouteInfo struct {
 // RouteUpdate records a set of routes that should be advertised and a set of
 // routes that should be unadvertised in event bus updates.
 type RouteUpdate struct {
+	SourceID    uint64
+	SourceEpoch uint64
 	Advertise   []netip.Prefix
 	Unadvertise []netip.Prefix
 }

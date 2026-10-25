@@ -44,6 +44,7 @@ import (
 	"tailscale.com/envknob/featureknob"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/featurepolicy"
 	"tailscale.com/health"
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/hostinfo"
@@ -314,14 +315,36 @@ type LocalBackend struct {
 	// of [LocalBackend]'s own state that is not tied to the node context.
 	currentNodeAtomic atomic.Pointer[nodeBackend]
 
-	diskCache        diskCache
-	conf             *conffile.Config // latest parsed config, or nil if not in declarative mode
-	pm               *profileManager  // mu guards access
-	lastFilterInputs *filterInputs
-	httpTestClient   *http.Client       // for controlclient. nil by default, used by tests.
-	ccGen            clientGen          // function for producing controlclient; lazily populated
-	sshServer        SSHServer          // or nil, initialized lazily.
-	appConnector     *appc.AppConnector // or nil, initialized when configured.
+	diskCache                diskCache
+	conf                     *conffile.Config // latest parsed config, or nil if not in declarative mode
+	pm                       *profileManager  // mu guards access
+	unifiedWake              chan struct{}
+	unifiedProfileID         string
+	unifiedStop              chan struct{}
+	unifiedDone              chan struct{}
+	unifiedWorkerStopped     bool
+	unifiedRuntime           *unifiedPolicyRuntime
+	unifiedConsumerFence     featurepolicy.Fence           // installed synchronous DNS consumer
+	unifiedOwners            map[netip.Prefix]PrefixOwners // guarded by mu; committed ledger view
+	unifiedOwnersProfile     string
+	unifiedOwnerPub          *eventbus.Publisher[appctype.RouteOwnerEvent]
+	unifiedOwnership         bool           // guarded by mu; fail closed across failed recompiles
+	unifiedControlRoutes     []netip.Prefix // guarded by mu
+	unifiedPrefsPendingSince time.Time      // oldest in-flight owner/prefs transaction
+	unifiedTTLBlocked        bool           // failed durable TTL commit; restart recovery required
+	unifiedPrefsPending      chan struct{}  // guarded by mu; non-nil during route persistence
+	unifiedRevision          uint64
+	unifiedPublishedRevision uint64
+	unifiedDomainsEpoch      uint64
+	unifiedDomains           []string
+	unifiedSnapshot          *featurepolicy.PolicySnapshot
+	unifiedStatus            UnifiedPolicyStatus
+	unifiedHealth            unifiedHealthState // guarded by mu; persistent consumer failures
+	lastFilterInputs         *filterInputs
+	httpTestClient           *http.Client       // for controlclient. nil by default, used by tests.
+	ccGen                    clientGen          // function for producing controlclient; lazily populated
+	sshServer                SSHServer          // or nil, initialized lazily.
+	appConnector             *appc.AppConnector // or nil, initialized when configured.
 	// notifyCancel cancels notifications to the current SetNotifyCallback.
 	notifyCancel context.CancelFunc
 	cc           controlclient.Client // TODO(nickkhyl): move to nodeBackend
@@ -539,6 +562,11 @@ type clientGen func(controlclient.Options) (controlclient.Client, error)
 //
 // The logID may be the zero value if logging is not in use.
 func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, loginFlags controlclient.LoginFlags) (_ *LocalBackend, err error) {
+	policyPath := unifiedPolicyFile()
+	if policyPath == "" {
+		policyPath = "/etc/tailscale/unified-policy.json"
+	}
+	policyRead := func() ([]byte, error) { return featurepolicy.ReadFile(policyPath) }
 	e := sys.Engine.Get()
 	store := sys.StateStore.Get()
 	dialer := sys.Dialer.Get()
@@ -557,6 +585,13 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	pm, err := newProfileManagerWithGOOS(store, logf, sys.HealthTracker.Get(), goos)
 	if err != nil {
 		return nil, err
+	}
+	var policyStore featurepolicy.Store
+	if p := pm.CurrentProfile(); p.ID() != "" && p.Key() != "" && store != nil {
+		policyStore = UnifiedPolicyStore{Store: store, ProfileID: string(p.ID()), ProfileKey: p.Key()}
+	}
+	if err := featurepolicy.CheckStartup(policyStore, string(pm.CurrentProfile().ID()), policyRead); err != nil {
+		return nil, fmt.Errorf("unified policy startup: %w", err)
 	}
 	if sds, ok := store.(ipn.StateStoreDialerSetter); ok {
 		sds.SetDialer(dialer.SystemDial)
@@ -605,6 +640,9 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		clock:        clock,
 	}
 
+	b.unifiedWake = make(chan struct{}, 1)
+	b.unifiedProfileID = string(pm.CurrentProfile().ID())
+	pm.StateChangeHook = b.unifiedProfileChanged
 	sys.NoiseRoundTripper.Set(noiseRoundTripper{b})
 
 	nb := newNodeBackend(ctx, b.logf, b.sys.Bus.Get())
@@ -709,7 +747,15 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	if buildfeatures.HasPortList {
 		eventbus.SubscribeFunc(ec, b.setPortlistServices)
 	}
+	b.unifiedOwnerPub = eventbus.Publish[appctype.RouteOwnerEvent](ec)
 	eventbus.SubscribeFunc(ec, b.onAppConnectorRouteUpdate)
+	eventbus.SubscribeFunc(ec, func(e appctype.RouteOwnerEvent) {
+		b.appcTask.Add(func() {
+			if err := b.ApplyUnifiedOwner(e); err != nil {
+				b.logf("unified owner: %v", err)
+			}
+		})
+	})
 	eventbus.SubscribeFunc(ec, b.onAppConnectorStoreRoutes)
 	eventbus.SubscribeFunc(ec, b.onHomeDERPUpdate)
 	mConn.SetNetInfoCallback(b.setNetInfo) // TODO(tailscale/tailscale#17887): move to eventbus
@@ -720,26 +766,49 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		}
 	}
 
+	// Keep construction synchronous: callers finish injecting backend dependencies
+	// before Start. In particular, do not race test profile/store replacements.
+	b.unifiedRuntime = newUnifiedPolicyRuntime(policyRead)
 	return b, nil
 }
 
 func (b *LocalBackend) onAppConnectorRouteUpdate(ru appctype.RouteUpdate) {
+	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
+	owned := b.ownershipRequestedLocked()
+	b.mu.Unlock()
+	if owned {
+		return
+	} // Typed control and synchronous DNS consumers own these routes.
 	// TODO(creachadair, 2025-10-02): It is currently possible for updates produced under
 	// one profile to arrive and be applied after a switch to another profile.
 	// We need to find a way to ensure that changes to the backend state are applied
 	// consistently in the presnce of profile changes, which currently may not happen in
 	// a single atomic step.  See: https://github.com/tailscale/tailscale/issues/17414
 	b.appcTask.Add(func() {
-		if err := b.AdvertiseRoute(ru.Advertise...); err != nil {
-			b.logf("appc: failed to advertise routes: %v: %v", ru.Advertise, err)
+		b.mu.Lock()
+		b.waitUnifiedPrefsTransactionLocked()
+		defer b.mu.Unlock()
+		if b.ownershipRequestedLocked() || ru.SourceID != 0 && !b.appConnector.AcceptLegacyEvent(ru.SourceID, ru.SourceEpoch) {
+			return
 		}
-		if err := b.UnadvertiseRoute(ru.Unadvertise...); err != nil {
-			b.logf("appc: failed to unadvertise routes: %v: %v", ru.Unadvertise, err)
+		if err := b.advertiseRouteLocked(ru.Advertise...); err != nil {
+			b.logf("appc advertise: %v", err)
+		}
+		if err := b.unadvertiseRouteLocked(ru.Unadvertise...); err != nil {
+			b.logf("appc unadvertise: %v", err)
 		}
 	})
 }
 
 func (b *LocalBackend) onAppConnectorStoreRoutes(ri appctype.RouteInfo) {
+	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
+	owned := b.ownershipRequestedLocked()
+	b.mu.Unlock()
+	if owned {
+		return
+	} // Untyped legacy snapshots cannot cross the profile fence.
 	// Whether or not routes should be stored can change over time.
 	shouldStoreRoutes := b.ControlKnobs().AppCStoreRoutes.Load()
 	if shouldStoreRoutes {
@@ -1001,6 +1070,7 @@ func (b *LocalBackend) Dialer() *tsdial.Dialer {
 // success, or (false, error) on failure.
 func (b *LocalBackend) ReloadConfig() (ok bool, err error) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	if b.conf == nil {
 		return false, nil
@@ -1291,6 +1361,8 @@ func (b *LocalBackend) ClearCaptureSink() {
 func (b *LocalBackend) Shutdown() {
 	defer b.CheckDeadlocks()()
 
+	b.stopUnifiedPolicy()
+
 	// Close the [eventbus.Client] to wait for subscribers to
 	// return before acquiring b.mu:
 	//  1. Event handlers also acquire b.mu, they can deadlock with c.Shutdown().
@@ -1303,6 +1375,7 @@ func (b *LocalBackend) Shutdown() {
 	b.em.close()
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	if b.shutdownCalled {
 		b.mu.Unlock()
 		return
@@ -1326,6 +1399,7 @@ func (b *LocalBackend) Shutdown() {
 			b.logf("logged out ephemeral node on shutdown")
 		}
 		b.mu.Lock()
+		b.waitUnifiedPrefsTransactionLocked()
 	}
 	cc := b.cc
 	if b.sshServer != nil {
@@ -1806,6 +1880,7 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		return
 	}
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	b.setControlClientStatusLocked(c, st)
 }
@@ -1991,6 +2066,7 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 			b.logf("[v1] TKA sync error: %v", err)
 		}
 		b.mu.Lock()
+		b.waitUnifiedPrefsTransactionLocked()
 		// As we stepped outside of the lock, it's possible for b.cc
 		// to now be nil.
 		if b.cc != nil {
@@ -2328,6 +2404,7 @@ func (b *LocalBackend) registerSysPolicyWatch() (unregister func(), err error) {
 // b.mu must not be held.
 func (b *LocalBackend) reconcilePrefs() (_ ipn.PrefsView, anyChange bool) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	prefs := b.pm.CurrentPrefs().AsStruct()
@@ -2347,6 +2424,7 @@ func (b *LocalBackend) sysPolicyChanged(policy policyclient.PolicyChange) {
 		// we should reset the overrideAlwaysOn flag, as the override might
 		// no longer be valid.
 		b.mu.Lock()
+		b.waitUnifiedPrefsTransactionLocked()
 		b.overrideAlwaysOn = false
 		b.mu.Unlock()
 	}
@@ -2355,6 +2433,7 @@ func (b *LocalBackend) sysPolicyChanged(policy policyclient.PolicyChange) {
 		// Reset the exit node override if a policy that enforces exit node usage
 		// or allows the user to override automatic exit node selection has changed.
 		b.mu.Lock()
+		b.waitUnifiedPrefsTransactionLocked()
 		b.overrideExitNodePolicy = false
 		b.mu.Unlock()
 	}
@@ -2415,6 +2494,7 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	}()
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	cn := b.currentNode()
@@ -2429,7 +2509,11 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	muts = b.tkaFilterDeltaMutsLocked(muts)
 	needsAuthReconfig := netmapDeltaNeedsAuthReconfig(cn, muts)
 
+	oldUnifiedPeers := cn.Peers()
 	deltaRes, _ := cn.UpdateNetmapDelta(muts)
+	if !sameUnifiedPeerIdentities(oldUnifiedPeers, cn.Peers()) {
+		b.signalUnifiedPolicyLocked()
+	}
 	if buildfeatures.HasDrive {
 		// Drive's lazy remotes-source caches its rebuild keyed by this
 		// generation, so any delta — peer add/remove, address change,
@@ -2879,6 +2963,7 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	// For now, only check this in the callback, but don't check it in setWgengineStatusLocked
@@ -3016,11 +3101,13 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	b.DisconnectControl()
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	return b.startLocked(opts)
 }
 
 func (b *LocalBackend) startLocked(opts ipn.Options) error {
+	b.startUnifiedPolicyLocked(b.unifiedRuntime)
 	b.logf("Start")
 	logf := logger.WithPrefix(b.logf, "Start: ")
 	b.startOnce.Do(b.initOnce)
@@ -3938,6 +4025,7 @@ func (b *LocalBackend) DebugNotify(n ipn.Notify) {
 // incrementally.
 func (b *LocalBackend) DebugForceNetmapUpdate() {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	// TODO(nickkhyl): this all should be done in [LocalBackend.setNetMapLocked].
 	nm := b.currentNode().NetMap()
@@ -4377,6 +4465,7 @@ func (b *LocalBackend) onClientVersion(v *tailcfg.ClientVersion) {
 
 func (b *LocalBackend) onTailnetDefaultAutoUpdate(au bool) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	prefs := b.pm.CurrentPrefs()
@@ -4637,6 +4726,7 @@ func (b *LocalBackend) StartLoginInteractiveAs(ctx context.Context, user ipnauth
 		return errors.New("cannot log in when state store is unhealthy")
 	}
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	if b.cc == nil {
 		panic("LocalBackend.assertClient: b.cc == nil")
@@ -4790,6 +4880,7 @@ func (b *LocalBackend) parseWgStatusLocked(s *wgengine.Status) (ret ipn.EngineSt
 // On non-multi-user systems, the actor should be set to nil.
 func (b *LocalBackend) SetCurrentUser(actor ipnauth.Actor) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	var userIdentifier string
@@ -4823,6 +4914,7 @@ func (b *LocalBackend) SetCurrentUser(actor ipnauth.Actor) {
 // for logging.
 func (b *LocalBackend) SwitchToBestProfile(reason string) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	b.switchToBestProfileLocked(reason)
 }
@@ -5087,6 +5179,7 @@ func checkAdvertiseRoutes(p *ipn.Prefs) error {
 // nor is true when the exit node is already in use.
 func (b *LocalBackend) SetUseExitNodeEnabled(actor ipnauth.Actor, v bool) (ipn.PrefsView, error) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	p0 := b.pm.CurrentPrefs()
@@ -5137,6 +5230,12 @@ func (b *LocalBackend) SetUseExitNodeEnabled(actor ipnauth.Actor, v bool) (ipn.P
 // MaybeClearAppConnector clears the routes from any AppConnector if
 // AdvertiseRoutes has been set in the MaskedPrefs.
 func (b *LocalBackend) MaybeClearAppConnector(mp *ipn.MaskedPrefs) error {
+	b.mu.Lock()
+	owned := b.ownershipRequestedLocked()
+	b.mu.Unlock()
+	if owned {
+		return nil
+	} // Ordinary manual edits never erase automatic evidence.
 	if !buildfeatures.HasAppConnectors {
 		return nil
 	}
@@ -5164,6 +5263,7 @@ func (b *LocalBackend) EditPrefsAs(mp *ipn.MaskedPrefs, actor ipnauth.Actor) (ip
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	return b.editPrefsLocked(actor, mp)
 }
@@ -5366,6 +5466,7 @@ func (b *LocalBackend) startReconnectTimerLocked(d time.Duration) {
 	var reconnectTimer tstime.TimerController
 	reconnectTimer = b.clock.AfterFunc(d, func() {
 		b.mu.Lock()
+		b.waitUnifiedPrefsTransactionLocked()
 		defer b.mu.Unlock()
 
 		if b.reconnectTimer != reconnectTimer {
@@ -5417,6 +5518,9 @@ func (b *LocalBackend) stopReconnectTimerLocked() {
 
 // b.mu must be held.
 func (b *LocalBackend) editPrefsLocked(actor ipnauth.Actor, mp *ipn.MaskedPrefs) (ipn.PrefsView, error) {
+	if b.unifiedTTLBlocked {
+		return ipn.PrefsView{}, fmt.Errorf("appc TTL: restart recovery required")
+	}
 	syncs.RequiresMutex(&b.mu)
 	p0 := b.pm.CurrentPrefs()
 
@@ -5429,6 +5533,31 @@ func (b *LocalBackend) editPrefsLocked(actor ipnauth.Actor, mp *ipn.MaskedPrefs)
 	// Apply additional changes to mp if necessary,
 	// such as clearing mutually exclusive fields.
 	b.adjustEditPrefsLocked(p0, mp)
+
+	if mp.AdvertiseRoutesSet && b.ownershipRequestedLocked() {
+		if b.unifiedSnapshot == nil || !b.unifiedSnapshot.OwnershipEnabled() {
+			return ipn.PrefsView{}, fmt.Errorf("owner transition pending")
+		}
+		// Profile metadata is a separate upstream multi-key transaction. Keep
+		// it out of this journal until it has an atomic store contract.
+		if mp.ProfileNameSet || mp.EggSet {
+			return ipn.PrefsView{}, fmt.Errorf("edit profile name/egg separately from managed routes")
+		}
+		candidate := p0.AsStruct()
+		candidate.ApplyEdits(mp)
+		if err := b.checkPrefsLocked(candidate); err != nil {
+			return ipn.PrefsView{}, err
+		}
+		b.reconcilePrefsLocked(candidate)
+		if err := b.checkPrefsLocked(candidate); err != nil {
+			return ipn.PrefsView{}, err
+		}
+		e := appctype.RouteOwnerEvent{Fence: b.unifiedSnapshot.Fence(), Source: appctype.RouteOwnerManual, Prefixes: slices.Clone(mp.AdvertiseRoutes)}
+		if err := b.applyUnifiedOwnerLocked(e, candidate, mp, actor); err != nil {
+			return ipn.PrefsView{}, err
+		}
+		return stripKeysFromPrefs(b.pm.CurrentPrefs()), nil
+	}
 
 	if mp.EggSet {
 		mp.EggSet = false
@@ -5485,6 +5614,28 @@ func (b *LocalBackend) checkProfileNameLocked(p *ipn.Prefs) error {
 // newp ownership passes to this function.
 // It returns a read-only copy of the new prefs.
 func (b *LocalBackend) setPrefsLocked(newp *ipn.Prefs) ipn.PrefsView {
+	return b.setPrefsMaybeCommittedLocked(newp, false)
+}
+
+// installCommittedRoutePrefsLocked installs an already durable route-only edit.
+// It must not reconcile or rewrite the acknowledged record a second time.
+func (b *LocalBackend) installCommittedRoutePrefsLocked(newp *ipn.Prefs) ipn.PrefsView {
+	// A readvertise transaction can durably acknowledge the existing route
+	// union. Republishing identical prefs re-enters authReconfig, which queues
+	// another readvertise and continuously invalidates lifecycle preview CAS.
+	// The writer has already acknowledged the ledger; there is no prefs change
+	// to notify or reconfigure in this case.
+	if current := b.pm.CurrentPrefs(); current.Equals(newp.View()) {
+		return current
+	}
+	return b.setPrefsMaybeCommittedLocked(newp, true)
+}
+
+func (b *LocalBackend) setPrefsMaybeCommittedLocked(newp *ipn.Prefs, committed bool) ipn.PrefsView {
+	if b.unifiedTTLBlocked && !committed {
+		b.logf("appc TTL: prefs frozen pending restart recovery")
+		return b.pm.CurrentPrefs()
+	}
 	cn := b.currentNode()
 	netMap := cn.NetMap()
 	b.setAtomicValuesFromPrefsLocked(newp.View())
@@ -5497,7 +5648,9 @@ func (b *LocalBackend) setPrefsLocked(newp *ipn.Prefs) ipn.PrefsView {
 	// exit node resolution, and so on. The call returns whether it updated
 	// newp, but everything in this function treats newp as completely new
 	// anyway, so its return value can be ignored here.
-	b.reconcilePrefsLocked(newp)
+	if !committed {
+		b.reconcilePrefsLocked(newp)
+	}
 
 	// We do this to avoid holding the lock while doing everything else.
 
@@ -5519,7 +5672,7 @@ func (b *LocalBackend) setPrefsLocked(newp *ipn.Prefs) ipn.PrefsView {
 			b.sshServer = nil
 		}
 	}
-	if netMap != nil {
+	if !committed && netMap != nil {
 		selfProfileView, _ := cn.UserByID(netMap.User())
 		newProfile := profileFromView(selfProfileView)
 		if newLoginName := newProfile.LoginName; newLoginName != "" {
@@ -5537,7 +5690,17 @@ func (b *LocalBackend) setPrefsLocked(newp *ipn.Prefs) ipn.PrefsView {
 
 	prefs := newp.View()
 	np := cmp.Or(cn.NetworkProfile(), b.pm.CurrentProfile().NetworkProfile())
-	if err := b.pm.SetPrefs(prefs, np); err != nil {
+	var saveErr error
+	if committed {
+		b.pm.prefs = prefs
+		if f := b.pm.StateChangeHook; f != nil {
+			f(b.pm.currentProfile, prefs, true)
+		}
+		b.pm.extHost.NotifyProfilePrefsChanged(b.pm.currentProfile, oldp, prefs)
+	} else {
+		saveErr = b.pm.SetPrefs(prefs, np)
+	}
+	if err := saveErr; err != nil {
 		b.logf("failed to save new controlclient state: %v", err)
 	} else if prefs.WantRunning() {
 		// Reset the always-on override if WantRunning is true in the new prefs,
@@ -5922,10 +6085,18 @@ func (b *LocalBackend) reconfigAppConnectorLocked(selfNode tailcfg.NodeView, pre
 		}
 	}()
 
-	// App connectors have been disabled.
+	// App connectors have been disabled. Repeated reconciliation must not
+	// invalidate its own policy fence and trigger an endless durable-write loop.
 	if !prefs.AppConnector().Advertise {
-		b.appConnector.Close() // clean up a previous connector (safe on nil)
+		changed := b.appConnector != nil || len(b.unifiedDomains) > 0 || len(b.unifiedControlRoutes) > 0
+		b.appConnector.Close()
 		b.appConnector = nil
+		b.unifiedDomains = nil
+		b.unifiedControlRoutes = nil
+		if changed {
+			b.unifiedDomainsEpoch++
+			b.signalUnifiedPolicyLocked()
+		}
 		return
 	}
 
@@ -5938,7 +6109,9 @@ func (b *LocalBackend) reconfigAppConnectorLocked(selfNode tailcfg.NodeView, pre
 			b.logf("Unsuccessful Read RouteInfo: %v", err)
 		}
 		b.appConnector.Close() // clean up a previous connector (safe on nil)
+		b.signalUnifiedPolicyLocked()
 		b.appConnector = appc.NewAppConnector(appc.Config{
+			SourceID:        b.unifiedRevision,
 			Logf:            b.logf,
 			EventBus:        b.sys.Bus.Get(),
 			RouteInfo:       ri,
@@ -5946,12 +6119,24 @@ func (b *LocalBackend) reconfigAppConnectorLocked(selfNode tailcfg.NodeView, pre
 		})
 	}
 	if !selfNode.Valid() {
+		if len(b.unifiedDomains) > 0 || len(b.unifiedControlRoutes) > 0 {
+			b.unifiedDomains = nil
+			b.unifiedControlRoutes = nil
+			b.unifiedDomainsEpoch++
+			b.signalUnifiedPolicyLocked()
+		}
 		return
 	}
 
 	attrs, err := tailcfg.UnmarshalNodeCapViewJSON[appctype.AppConnectorAttr](selfNode.CapMap(), appConnectorCapName)
 	if err != nil {
 		b.logf("[unexpected] error parsing app connector mapcap: %v", err)
+		if len(b.unifiedDomains) > 0 || len(b.unifiedControlRoutes) > 0 {
+			b.unifiedDomains = nil
+			b.unifiedControlRoutes = nil
+			b.unifiedDomainsEpoch++
+			b.signalUnifiedPolicyLocked()
+		}
 		return
 	}
 
@@ -5976,10 +6161,44 @@ func (b *LocalBackend) reconfigAppConnectorLocked(selfNode tailcfg.NodeView, pre
 	slices.SortFunc(routes, func(i, j netip.Prefix) int { return i.Addr().Compare(j.Addr()) })
 	domains = slices.Compact(domains)
 	routes = slices.Compact(routes)
+	if !slices.Equal(b.unifiedDomains, domains) {
+		b.unifiedDomains = slices.Clone(domains)
+		b.unifiedDomainsEpoch++
+		b.signalUnifiedPolicyLocked()
+	}
+	if !slices.Equal(b.unifiedControlRoutes, routes) {
+		b.unifiedControlRoutes = slices.Clone(routes)
+		b.signalUnifiedPolicyLocked()
+	}
 	b.appConnector.UpdateDomainsAndRoutes(domains, routes)
 }
 
 func (b *LocalBackend) readvertiseAppConnectorRoutes() {
+	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
+	owned := b.ownershipRequestedLocked()
+	var fence featurepolicy.Fence
+	if owned {
+		// Profile/control transitions can invalidate the snapshot while typed
+		// ownership remains active. Reconciliation will restore advertisements;
+		// do not dereference a missing fence or fall back to the legacy writer.
+		if b.unifiedSnapshot == nil {
+			b.mu.Unlock()
+			return
+		}
+		fence = b.unifiedSnapshot.Fence()
+	}
+	b.mu.Unlock()
+	if owned {
+		if b.unifiedOwnerPub != nil {
+			b.unifiedOwnerPub.Publish(appctype.RouteOwnerEvent{Fence: fence, Source: appctype.RouteOwnerReadvertise})
+			return
+		}
+		if err := b.ApplyUnifiedOwner(appctype.RouteOwnerEvent{Fence: fence, Source: appctype.RouteOwnerReadvertise}); err != nil {
+			b.logf("unified readvertise: %v", err)
+		}
+		return
+	}
 	// Note: we should never call b.appConnector methods while holding b.mu.
 	// This can lead to a deadlock, like
 	// https://github.com/tailscale/corp/issues/25965.
@@ -6029,6 +6248,7 @@ func (b *LocalBackend) authReconfig() {
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	// Allow another goroutine to become pending.
@@ -7059,6 +7279,7 @@ func (b *LocalBackend) ShouldForwardToVia(via netip.Addr) bool {
 // complete.
 func (b *LocalBackend) Logout(ctx context.Context, actor ipnauth.Actor) error {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 
 	if !b.hasNodeKeyLocked() {
 		// Already logged out.
@@ -7102,6 +7323,7 @@ func (b *LocalBackend) Logout(ctx context.Context, actor ipnauth.Actor) error {
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	if err := b.pm.DeleteProfile(profile.ID()); err != nil {
@@ -7115,6 +7337,7 @@ func (b *LocalBackend) Logout(ctx context.Context, actor ipnauth.Actor) error {
 // controlclient, if one exists.
 func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	cc := b.cc
 	var refresh bool
 	if b.MagicConn().DERPs() > 0 || testenv.InTest() {
@@ -7160,6 +7383,7 @@ func (b *LocalBackend) RefreshExitNode() {
 		return
 	}
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	b.refreshExitNodeLocked()
 }
@@ -7290,7 +7514,15 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	if nm != nil {
 		login = cmp.Or(profileFromView(nm.UserProfiles[nm.User()]).LoginName, "<missing-profile>")
 	}
+	oldUnifiedPeers := b.currentNode().Peers()
 	discoChanged, routeChanged := b.currentNode().SetNetMap(nm)
+	if nm == nil && len(b.unifiedDomains) > 0 {
+		b.unifiedDomains = nil
+		b.unifiedDomainsEpoch++
+	}
+	if oldNetMap == nil || nm == nil || !sameUnifiedPeerIdentities(oldUnifiedPeers, b.currentNode().Peers()) || !sameUnifiedPeerIdentities([]tailcfg.NodeView{oldSelf}, []tailcfg.NodeView{nm.SelfNode}) {
+		b.signalUnifiedPolicyLocked()
+	}
 	b.setDataPlanePeerRoutes()
 	if ms, ok := b.sys.MagicSock.GetOK(); ok {
 		if nm != nil {
@@ -7948,6 +8180,7 @@ func (b *LocalBackend) DebugRotateDiscoKey() error {
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	cc := b.cc
 	wantRunning := b.pm.CurrentPrefs().WantRunning()
 	b.mu.Unlock()
@@ -8294,6 +8527,7 @@ func (b *LocalBackend) ShouldInterceptVIPServiceTCPPort(ap netip.AddrPort) bool 
 // If the profile is not known, it returns an errProfileNotFound.
 func (b *LocalBackend) SwitchProfile(profile ipn.ProfileID) error {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	oldControlURL := b.pm.CurrentPrefs().ControlURLOrDefault(b.polc)
@@ -8366,6 +8600,7 @@ func (b *LocalBackend) resetForProfileChangeLocked() error {
 // If the profile is not known, it is a no-op.
 func (b *LocalBackend) DeleteProfile(p ipn.ProfileID) error {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	needToRestart := b.pm.CurrentProfile().ID() == p
@@ -8401,6 +8636,7 @@ func (b *LocalBackend) NewProfile() error {
 		return errors.New("cannot log in when state store is unhealthy")
 	}
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	b.pm.SwitchToNewProfile()
@@ -8425,6 +8661,7 @@ func (b *LocalBackend) ListProfiles() []ipn.LoginProfileView {
 // called to register it as new node.
 func (b *LocalBackend) ResetAuth() error {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 
 	if prevCC := b.resetControlClientLocked(); prevCC != nil {
@@ -8483,6 +8720,10 @@ func (b *LocalBackend) ObserveDNSResponse(res []byte) error {
 		b.mu.Unlock()
 		return nil
 	}
+	if b.ownershipRequestedLocked() && (b.unifiedSnapshot == nil || b.unifiedPublishedRevision != b.unifiedRevision || b.unifiedConsumerFence != b.unifiedSnapshot.Fence()) {
+		b.mu.Unlock()
+		return &appc.LeaseObservationError{Err: fmt.Errorf("owner consumer reconciling")}
+	}
 	appConnector = b.appConnector
 	b.mu.Unlock()
 
@@ -8496,7 +8737,19 @@ var ErrDisallowedAutoRoute = errors.New("route is not allowed")
 // new route advertisement if one is not already present in the existing
 // routes.  If the route is disallowed, ErrDisallowedAutoRoute is returned.
 func (b *LocalBackend) AdvertiseRoute(ipps ...netip.Prefix) error {
-	finalRoutes := b.Prefs().AdvertiseRoutes().AsSlice()
+	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
+	defer b.mu.Unlock()
+	return b.advertiseRouteLocked(ipps...)
+}
+
+func (b *LocalBackend) advertiseRouteLocked(ipps ...netip.Prefix) error {
+	owned := b.ownershipRequestedLocked()
+	if owned {
+		return fmt.Errorf("untyped route update rejected while ownership is enabled")
+	}
+
+	finalRoutes := slices.Clone(b.pm.CurrentPrefs().AdvertiseRoutes().AsSlice())
 	var newRoutes []netip.Prefix
 
 	for _, ipp := range ipps {
@@ -8524,7 +8777,7 @@ func (b *LocalBackend) AdvertiseRoute(ipps ...netip.Prefix) error {
 	}
 
 	b.logf("advertising new app connector routes: %v", newRoutes)
-	_, err := b.EditPrefs(&ipn.MaskedPrefs{
+	_, err := b.editPrefsLocked(ipnauth.Self, &ipn.MaskedPrefs{
 		Prefs: ipn.Prefs{
 			AdvertiseRoutes: finalRoutes,
 		},
@@ -8556,7 +8809,19 @@ func coveredRouteRangeNoDefault(finalRoutes []netip.Prefix, ipp netip.Prefix) bo
 // UnadvertiseRoute implements the appctype.RouteAdvertiser interface. It
 // removes a route advertisement if one is present in the existing routes.
 func (b *LocalBackend) UnadvertiseRoute(toRemove ...netip.Prefix) error {
-	currentRoutes := b.Prefs().AdvertiseRoutes().AsSlice()
+	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
+	defer b.mu.Unlock()
+	return b.unadvertiseRouteLocked(toRemove...)
+}
+
+func (b *LocalBackend) unadvertiseRouteLocked(toRemove ...netip.Prefix) error {
+	owned := b.ownershipRequestedLocked()
+	if owned {
+		return fmt.Errorf("untyped route update rejected while ownership is enabled")
+	}
+
+	currentRoutes := slices.Clone(b.pm.CurrentPrefs().AdvertiseRoutes().AsSlice())
 	finalRoutes := currentRoutes[:0]
 
 	for _, ipp := range currentRoutes {
@@ -8566,7 +8831,7 @@ func (b *LocalBackend) UnadvertiseRoute(toRemove ...netip.Prefix) error {
 		finalRoutes = append(finalRoutes, ipp)
 	}
 
-	_, err := b.EditPrefs(&ipn.MaskedPrefs{
+	_, err := b.editPrefsLocked(ipnauth.Self, &ipn.MaskedPrefs{
 		Prefs: ipn.Prefs{
 			AdvertiseRoutes: finalRoutes,
 		},
@@ -8587,7 +8852,11 @@ func (b *LocalBackend) storeRouteInfo(ri appctype.RouteInfo) error {
 		return feature.ErrUnavailable
 	}
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
+	if b.ownershipRequestedLocked() || ri.SourceID != 0 && !b.appConnector.AcceptLegacyEvent(ri.SourceID, ri.SourceEpoch) {
+		return nil
+	}
 	if b.pm.CurrentProfile().ID() == "" {
 		return nil
 	}
@@ -8600,10 +8869,38 @@ func (b *LocalBackend) storeRouteInfo(ri appctype.RouteInfo) error {
 }
 
 func (b *LocalBackend) readRouteInfoLocked() (*appctype.RouteInfo, error) {
+	if b.unifiedTTLBlocked {
+		return nil, fmt.Errorf("appc TTL: restart recovery required")
+	}
 	if !buildfeatures.HasAppConnectors {
 		return nil, feature.ErrUnavailable
 	}
 	if b.pm.CurrentProfile().ID() == "" {
+		return &appctype.RouteInfo{}, nil
+	}
+	// Recovering ownership must gate legacy writers before the lifecycle worker
+	// publishes its first snapshot. Do not load a possibly pre-handoff view.
+	policyStore := UnifiedPolicyStore{Store: b.pm.Store(), ProfileKey: b.pm.CurrentProfile().Key()}
+	pending, markerErr := policyStore.HandoffPending()
+	ttlIntent, ttlErr := readConnectorIntent(b.pm.Store(), b.pm.CurrentProfile().Key())
+	if ttlErr != nil || ttlIntent.Schema != 0 && (!ttlIntent.Complete || !ttlIntent.Handoff) {
+		b.unifiedOwnership = true
+	}
+	if ttlErr != nil {
+		return nil, ttlErr
+	}
+	if ttlIntent.Schema != 0 && !ttlIntent.Complete {
+		return nil, fmt.Errorf("appc TTL: recovery pending")
+	}
+	clearIntent, clearErr := readClearIntent(b.pm.Store(), b.pm.CurrentProfile().Key())
+	if pending || markerErr != nil || clearErr != nil || clearIntent.Schema != 0 && !clearIntent.Complete {
+		b.unifiedOwnership = true
+		if markerErr != nil {
+			return nil, markerErr
+		}
+		if clearErr != nil {
+			return nil, clearErr
+		}
 		return &appctype.RouteInfo{}, nil
 	}
 	key := namespaceKeyForCurrentProfile(b.pm, routeInfoStateStoreKey)
@@ -8623,6 +8920,7 @@ func (b *LocalBackend) readRouteInfoLocked() (*appctype.RouteInfo, error) {
 // to date with the RouteInfo in memory being used by appc.
 func (b *LocalBackend) ReadRouteInfo() (*appctype.RouteInfo, error) {
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	defer b.mu.Unlock()
 	return b.readRouteInfoLocked()
 }

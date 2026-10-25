@@ -95,8 +95,9 @@ type GROFilterFunc func(p *packet.Parsed, w *Wrapper, g *gro.GRO) (filter.Respon
 // A Wrapper starts in a "corked" mode where Read calls are blocked
 // until the Wrapper's Start method is called.
 type Wrapper struct {
-	logf        logger.Logf
-	limitedLogf logger.Logf // aggressively rate-limited logf used for potentially high volume errors
+	activityObserver atomic.Pointer[activityObserver]
+	logf             logger.Logf
+	limitedLogf      logger.Logf // aggressively rate-limited logf used for potentially high volume errors
 	// tdev is the underlying Wrapper device.
 	tdev  tun.Device
 	isTAP bool // whether tdev is a TAP device
@@ -824,6 +825,7 @@ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConf
 		return filter.Drop, gro
 	}
 
+	t.observeAcceptedActivity(p, false)
 	if t.PostFilterPacketOutboundToWireGuard != nil {
 		if res := t.PostFilterPacketOutboundToWireGuard(p, t); res.IsDrop() {
 			return res, gro
@@ -1204,6 +1206,7 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 		return filter.Drop, gro
 	}
 
+	t.observeAcceptedActivity(p, true)
 	if t.PostFilterPacketInboundFromWireGuardAppConnector != nil {
 		if res := t.PostFilterPacketInboundFromWireGuardAppConnector(p, t); res.IsDrop() {
 			// Handled by userspaceEngine's configured hook for Connectors 2025 app connectors.

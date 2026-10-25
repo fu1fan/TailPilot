@@ -60,3 +60,7 @@ client/web/build/assets
 /.stfolder
 fbstatus
 gafpush
+
+# local test byproducts (never part of a reviewed checkout)
+__pycache__/
+*.pyc

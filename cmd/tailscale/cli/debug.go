@@ -74,6 +74,9 @@ func debugCmd() *ffcli.Command {
 			return fs
 		})(),
 		Subcommands: nonNilCmds([]*ffcli.Command{
+			unifiedPolicyCmd(),
+			appcRouteCmd("appc-route-reset"),
+			appcRouteCmd("appc-route-adopt"),
 			{
 				Name:       "derp-map",
 				ShortUsage: "tailscale debug derp-map",

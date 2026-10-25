@@ -79,6 +79,7 @@ func (b *LocalBackend) DriveSetShare(share *drive.Share) error {
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	shares, err := b.driveSetShareLocked(share)
 	b.mu.Unlock()
 	if err != nil {
@@ -137,6 +138,7 @@ func (b *LocalBackend) DriveRenameShare(oldName, newName string) error {
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	shares, err := b.driveRenameShareLocked(oldName, newName)
 	b.mu.Unlock()
 	if err != nil {
@@ -197,6 +199,7 @@ func (b *LocalBackend) DriveRemoveShare(name string) error {
 	}
 
 	b.mu.Lock()
+	b.waitUnifiedPrefsTransactionLocked()
 	shares, err := b.driveRemoveShareLocked(name)
 	b.mu.Unlock()
 	if err != nil {

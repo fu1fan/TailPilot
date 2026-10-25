@@ -1,0 +1,19 @@
+{
+  "socket": "/run/tailscale/tailscaled.sock",
+  "tailscaleIPs": [
+    "100.64.0.1"
+  ],
+  "daemon": "/usr/sbin/tailscaled",
+  "cli": "/usr/bin/tailscale",
+  "unit": "/lib/systemd/system/tailscaled.service",
+  "dropins": [],
+  "stateFiles": [
+    "/var/lib/tailscale/tailscaled.state"
+  ],
+  "unitCatSHA256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "environmentFilesShow": "/etc/default/tailscaled (ignore_errors=yes)",
+  "minFreeBytes": 1073741824,
+  "minAvailableMemoryBytes": 134217728,
+  "fallbackEvidence": "/root/state-fallback-rehearsal.json",
+  "predecessorEvidenceFile": "/root/first-host-terminal.json"
+}

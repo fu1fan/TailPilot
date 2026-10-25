@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "machine": "residential",
+  "enabled": false,
+  "app_connector_ttl": {
+    "enabled": false
+  }
+}

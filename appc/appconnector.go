@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"tailscale.com/syncs"
@@ -138,6 +139,14 @@ type AppConnector struct {
 	// persisted route information.
 	hasStoredRoutes bool
 
+	ttl        atomic.Pointer[connectorTTL]
+	leaseSink  leaseSinkPointer
+	leaseEpoch atomic.Uint64
+	sourceID   uint64
+	// ttlBlocked mirrors connectorTTL.blocked for lock-free health projections.
+	// It is set only after a write may have started, never for a prewrite reject.
+	ttlBlocked atomic.Bool
+
 	// mu guards the fields that follow
 	mu syncs.Mutex
 
@@ -160,6 +169,8 @@ type AppConnector struct {
 
 // Config carries the settings for an [AppConnector].
 type Config struct {
+	// SourceID binds asynchronous events to one backend connector lifetime.
+	SourceID uint64
 	// Logf is the logger to which debug logs from the connector will be sent.
 	// It must be non-nil.
 	Logf logger.Logf
@@ -190,6 +201,7 @@ func NewAppConnector(c Config) *AppConnector {
 	ec := c.EventBus.Client("appc.AppConnector")
 
 	ac := &AppConnector{
+		sourceID:        c.SourceID,
 		logf:            logger.WithPrefix(c.Logf, "appc: "),
 		eventBus:        c.EventBus,
 		pubClient:       ec,
@@ -219,6 +231,9 @@ func (e *AppConnector) ShouldStoreRoutes() bool { return e.hasStoredRoutes }
 
 // storeRoutesLocked takes the current state of the AppConnector and persists it
 func (e *AppConnector) storeRoutesLocked() {
+	if e.leaseSink.Load() != nil {
+		return
+	}
 	if e.storePub.ShouldPublish() {
 		// log write rate and write size
 		numRoutes := int64(len(e.controlRoutes))
@@ -229,6 +244,7 @@ func (e *AppConnector) storeRoutesLocked() {
 		e.writeRateDay.update(numRoutes)
 
 		e.storePub.Publish(appctype.RouteInfo{
+			SourceID: e.sourceID, SourceEpoch: e.legacyEventEpoch(),
 			// Clone here, as the subscriber will handle these outside our lock.
 			Control:   slices.Clone(e.controlRoutes),
 			Domains:   maps.Clone(e.domains),
@@ -239,6 +255,9 @@ func (e *AppConnector) storeRoutesLocked() {
 
 // ClearRoutes removes all route state from the AppConnector.
 func (e *AppConnector) ClearRoutes() error {
+	if e.ttl.Load() != nil {
+		return fmt.Errorf("appc TTL: use preview-bound reset")
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.controlRoutes = nil
@@ -280,6 +299,9 @@ func (e *AppConnector) Close() {
 	if e == nil {
 		return
 	}
+	if t := e.ttl.Load(); t != nil {
+		t.stopRefresher()
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.queue.Shutdown() // TODO(creachadair): Should we wait for it too?
@@ -287,6 +309,10 @@ func (e *AppConnector) Close() {
 }
 
 func (e *AppConnector) updateDomains(domains []string) {
+	if e.ttl.Load() != nil {
+		e.logf("appc TTL: configuration requires lifecycle transaction")
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -335,7 +361,7 @@ func (e *AppConnector) updateDomains(domains []string) {
 					}
 				})
 			}
-			e.updatePub.Publish(appctype.RouteUpdate{Unadvertise: toRemove})
+			e.publishLegacyRouteUpdate(appctype.RouteUpdate{Unadvertise: toRemove})
 		}
 	}
 
@@ -347,6 +373,10 @@ func (e *AppConnector) updateDomains(domains []string) {
 // also more often whole ranges. UpdateRoutes will remove any single address routes that are now
 // covered by new ranges.
 func (e *AppConnector) updateRoutes(routes []netip.Prefix) {
+	if e.ttl.Load() != nil {
+		e.logf("appc TTL: configuration requires lifecycle transaction")
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -387,7 +417,7 @@ nextRoute:
 			}
 		})
 	}
-	e.updatePub.Publish(appctype.RouteUpdate{
+	e.publishLegacyRouteUpdate(appctype.RouteUpdate{
 		Advertise:   routes,
 		Unadvertise: toRemove,
 	})
@@ -471,16 +501,23 @@ func (e *AppConnector) isAddrKnownLocked(domain string, addr netip.Addr) bool {
 // scheduleAdvertisement schedules an advertisement of the given address
 // associated with the given domain.
 func (e *AppConnector) scheduleAdvertisement(domain string, routes ...netip.Prefix) {
+	epoch := e.leaseEpoch.Load()
 	e.queue.Add(func() {
+		if epoch != e.leaseEpoch.Load() || e.leaseSink.Load() != nil {
+			return
+		}
 		if e.routeAdvertiser != nil {
 			if err := e.routeAdvertiser.AdvertiseRoute(routes...); err != nil {
 				e.logf("failed to advertise routes for %s: %v: %v", domain, routes, err)
 				return
 			}
 		}
-		e.updatePub.Publish(appctype.RouteUpdate{Advertise: routes})
+		e.publishLegacyRouteUpdateAt(appctype.RouteUpdate{Advertise: routes}, epoch)
 		e.mu.Lock()
 		defer e.mu.Unlock()
+		if epoch != e.leaseEpoch.Load() || e.leaseSink.Load() != nil {
+			return
+		}
 
 		for _, route := range routes {
 			if !route.IsSingleIP() {
@@ -524,4 +561,31 @@ func routesWithout(a, b []netip.Prefix) []netip.Prefix {
 	return slicesx.Filter(make([]netip.Prefix, 0, len(a)), a, func(p netip.Prefix) bool {
 		return !m[p]
 	})
+}
+
+func (e *AppConnector) publishLegacyRouteUpdate(update appctype.RouteUpdate) {
+	e.publishLegacyRouteUpdateAt(update, e.leaseEpoch.Load())
+}
+func (e *AppConnector) publishLegacyRouteUpdateAt(update appctype.RouteUpdate, epoch uint64) {
+	if e.leaseSink.Load() != nil || epoch != e.leaseEpoch.Load() {
+		return
+	}
+	update.SourceID = e.sourceID
+	if e.sourceID != 0 {
+		update.SourceEpoch = epoch
+	}
+	e.updatePub.Publish(update)
+}
+
+func (e *AppConnector) legacyEventEpoch() uint64 {
+	if e.sourceID == 0 {
+		return 0
+	}
+	return e.leaseEpoch.Load()
+}
+
+// AcceptLegacyEvent performs no locking, so the backend may check it under its
+// writer barrier without introducing an appc/backend lock inversion.
+func (e *AppConnector) AcceptLegacyEvent(id, epoch uint64) bool {
+	return e != nil && id == e.sourceID && epoch == e.legacyEventEpoch() && e.leaseSink.Load() == nil
 }

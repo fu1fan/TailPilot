@@ -1,3 +1,19 @@
+# TailPilot
+
+Tailscale App Connector extensions for DNS lease expiry, IPv4-only DNS responses
+with dual-stack route learning, and configurable connection-path policy.
+
+This is an independent fork, not an official Tailscale release. The initial
+public snapshot is based on Tailscale v1.102.3 and the R6 implementation.
+Private operational history and deployment evidence are not included.
+Original upstream licensing and attribution are retained below and in LICENSE.
+
+Development and unprivileged CNB testing are being migrated in the CNB workflow
+branch. Production deployment always requires an explicit operator action;
+ordinary pushes must never modify a tailnet or a production host.
+
+---
+
 # Tailscale
 
 https://tailscale.com

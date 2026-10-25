@@ -530,3 +530,6 @@ require (
 )
 
 tool github.com/stacklok/frizbee
+
+// Patch06: fixed, repository-local authenticated receive extension.
+replace github.com/tailscale/wireguard-go => ./third_party/wireguard-go

@@ -23,6 +23,7 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/disco"
+	"tailscale.com/featurepolicy"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/stun"
@@ -61,6 +62,16 @@ func init() {
 // function can use the currently best known Tailscale endpoint to send packets
 // to the peer.
 type endpoint struct {
+	policyWGTimer       *time.Timer
+	policyWGAttempt     mono.Time
+	policyWGLastSuccess mono.Time
+	policyNextProbe     mono.Time
+	policyProbeSuccess  map[featurepolicy.Path]mono.Time
+	policyProbeFailure  map[featurepolicy.Path]mono.Time
+	policyPingIDs       [][12]byte
+	pathMachine         *featurepolicy.PathMachine // endpoint.mu
+	policyCandidates    map[featurepolicy.Path]addrQuality
+	policyLastProbe     mono.Time
 	// atomically accessed; declared first for alignment reasons
 	lastRecvWG            mono.Time // last time there were incoming packets from this peer destined for wireguard-go (e.g. not disco)
 	lastRecvUDPAny        mono.Time // last time there were incoming UDP packets from this peer of any kind
@@ -110,8 +121,29 @@ type endpoint struct {
 // be installed as de.bestAddr. It is only called by [relayManager] once it has
 // determined maybeBest is functional via [disco.Pong] reception.
 func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
+	de.c.mu.Lock()
+	defer de.c.mu.Unlock()
 	de.mu.Lock()
 	defer de.mu.Unlock()
+	if !de.c.decidePath(de.publicKey, featurepolicy.PeerRelay, featurepolicy.PathProbe, maybeBest.policyGeneration) {
+		return
+	}
+	if maybeBest.policyRelayLifetime > 0 {
+		maybeBest.policyTrustUntil = mono.Now().Add(maybeBest.policyRelayLifetime)
+	} else if de.c.pathPeer(de.publicKey) != nil {
+		maybeBest.policyTrustUntil = mono.Now().Add(trustUDPAddrDuration)
+	}
+	if de.c.authenticatedPathGate.Load() != nil {
+		de.c.peerMap.setNodeKeyForEpAddr(maybeBest.epAddr, de.publicKey)
+	}
+	if de.c.pathPeer(de.publicKey) != nil {
+		if de.policyCandidates == nil {
+			de.policyCandidates = map[featurepolicy.Path]addrQuality{}
+		}
+		de.policyCandidates[featurepolicy.PeerRelay] = maybeBest
+		publishRelayBinding(de.c.pathPeer(de.publicKey), maybeBest)
+		de.observePathLocked(maybeBest.epAddr, true, maybeBest.policyGeneration)
+	}
 	now := mono.Now()
 	curBestAddrTrusted := now.Before(de.trustBestAddrUntil)
 	sameRelayServer := de.bestAddr.vni.IsSet() && maybeBest.relayServerDisco.Compare(de.bestAddr.relayServerDisco) == 0
@@ -136,6 +168,9 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 }
 
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
+	if v.ap.IsValid() && !de.c.decidePath(de.publicKey, pathOf(v.epAddr), featurepolicy.PathPromote, de.c.pathGeneration()) {
+		return
+	}
 	if v.epAddr != de.bestAddr.epAddr {
 		de.probeUDPLifetime.resetCycleEndpointLocked()
 
@@ -385,12 +420,14 @@ type endpointDisco struct {
 }
 
 type sentPing struct {
-	to      epAddr
-	at      mono.Time
-	timer   *time.Timer // timeout timer
-	purpose discoPingPurpose
-	size    int                    // size of the disco message
-	resCB   *pingResultAndCallback // or nil for internal use
+	policyRelaySession uint64
+	policyGeneration   uint64
+	to                 epAddr
+	at                 mono.Time
+	timer              *time.Timer // timeout timer
+	purpose            discoPingPurpose
+	size               int                    // size of the disco message
+	resCB              *pingResultAndCallback // or nil for internal use
 }
 
 // endpointState is some state and history for a specific endpoint of
@@ -581,6 +618,10 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
 //
 // TODO(val): Rewrite the addrFor*Locked() variations to share code.
 func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
+	if de.c.pathPeer(de.publicKey) != nil {
+		udpAddr, derpAddr = de.policyAddrLocked()
+		return
+	}
 	udpAddr = de.bestAddr.epAddr
 
 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
@@ -868,6 +909,11 @@ func (de *endpoint) heartbeat() {
 		return
 	}
 
+	de.policyProbeLocked(now)
+	if de.c.pathPeer(de.publicKey) != nil {
+		de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
+		return
+	}
 	udpAddr, _, _ := de.addrForSendLocked(now)
 	if udpAddr.ap.IsValid() {
 		// We have a preferred path. Ping that every 'heartbeatInterval'.
@@ -903,6 +949,9 @@ func (de *endpoint) discoverUDPRelayPathsLocked(now mono.Time) {
 // wantUDPRelayPathDiscoveryLocked reports whether we should kick off UDP relay
 // path discovery.
 func (de *endpoint) wantUDPRelayPathDiscoveryLocked(now mono.Time) bool {
+	if !de.c.decidePath(de.publicKey, featurepolicy.PeerRelay, featurepolicy.PathProbe, de.c.pathGeneration()) {
+		return false
+	}
 	if runtime.GOOS == "js" {
 		return false
 	}
@@ -917,7 +966,7 @@ func (de *endpoint) wantUDPRelayPathDiscoveryLocked(now mono.Time) bool {
 	if !de.relayCapable {
 		return false
 	}
-	if de.bestAddr.isDirect() && now.Before(de.trustBestAddrUntil) {
+	if de.c.pathPeer(de.publicKey) == nil && de.bestAddr.isDirect() && now.Before(de.trustBestAddrUntil) {
 		return false
 	}
 	if !de.lastUDPRelayPathDiscovery.IsZero() && now.Sub(de.lastUDPRelayPathDiscovery) < discoverUDPRelayPathsInterval {
@@ -989,6 +1038,11 @@ func (p *pingResultAndCallback) reply() bool {
 func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnstate.PingResult)) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
+	if p := de.c.pathPeer(de.publicKey); p != nil && len(p.rule.Prefer) == 0 {
+		res.Err = errPolicyNoPath.Error()
+		cb(res)
+		return
+	}
 
 	if de.expired {
 		res.Err = errExpired.Error()
@@ -1005,6 +1059,9 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 
 	now := mono.Now()
 	udpAddr, derpAddr := de.addrForPingSizeLocked(now, size)
+	if de.c.pathPeer(de.publicKey) != nil {
+		derpAddr = de.derpAddr
+	}
 
 	if derpAddr.IsValid() {
 		de.startDiscoPingLocked(epAddr{ap: derpAddr}, now, pingCLI, size, resCB)
@@ -1057,7 +1114,14 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 
 	now := mono.Now()
+	policy := de.c.newPathSend(de.publicKey, featurepolicy.PathSend)
+	de.policyProbeLocked(now)
 	udpAddr, derpAddr, startWGPing := de.addrForSendLocked(now)
+	if a, ok := de.policyWGHandshakeLocked(buffs, offset, now, &policy); ok {
+		udpAddr = a
+		derpAddr = netip.AddrPort{}
+		startWGPing = false
+	}
 
 	if de.isWireguardOnly {
 		if startWGPing {
@@ -1074,6 +1138,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	de.mu.Unlock()
 
 	if !udpAddr.ap.IsValid() && !derpAddr.IsValid() {
+		if de.c.pathPeer(de.publicKey) != nil {
+			return errPolicyNoPath
+		}
 		// Make a last ditch effort to see if we have a DERP route for them. If
 		// they contacted us over DERP and we don't know their UDP endpoints or
 		// their DERP home, we can at least assume they're reachable over the
@@ -1086,13 +1153,16 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	var err error
 	if udpAddr.ap.IsValid() {
+		if !de.c.allowPathSend(policy, pathOf(udpAddr)) {
+			return errPolicyNoPath
+		}
 		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
 
 		// If the error is known to indicate that the endpoint is no longer
 		// usable, clear the endpoint statistics so that the next send will
 		// re-evaluate the best endpoint.
 		if err != nil && isBadEndpointErr(err) {
-			de.noteBadEndpoint(udpAddr)
+			de.noteBadEndpointPolicy(udpAddr, policy)
 		}
 
 		var txBytes int
@@ -1131,7 +1201,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 			buff = buff[offset:]
 			const isDisco = false
 			const isGeneveEncap = false
-			ok, _ := de.c.sendAddr(derpAddr, de.publicKey, buff, isDisco, isGeneveEncap)
+			ok, _ := de.c.sendAddrPolicy(derpAddr, de.publicKey, buff, isDisco, isGeneveEncap, policy)
 			txBytes += len(buff)
 			if !ok {
 				allOk = false
@@ -1191,6 +1261,12 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 	if !ok {
 		return
 	}
+	if !de.validPolicyPing(sp) {
+		sp.timer.Stop()
+		delete(de.sentPing, txid)
+		return
+	}
+	de.observeProbeLocked(sp, false)
 	bestUntrusted := mono.Now().After(de.trustBestAddrUntil)
 	if sp.to == de.bestAddr.epAddr && bestUntrusted {
 		de.clearBestAddrLocked()
@@ -1206,6 +1282,12 @@ func (de *endpoint) forgetDiscoPing(txid stun.TxID) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	if sp, ok := de.sentPing[txid]; ok {
+		if !de.validPolicyPing(sp) {
+			sp.timer.Stop()
+			delete(de.sentPing, txid)
+			return
+		}
+		de.observeProbeLocked(sp, false)
 		de.removeSentDiscoPingLocked(txid, sp, discoPingFailed)
 	}
 }
@@ -1250,14 +1332,28 @@ const discoPingSize = len(disco.Magic) + key.DiscoPublicRawLen + disco.NonceLen 
 // The caller should use de.discoKey as the discoKey argument.
 // It is passed in so that sendDiscoPing doesn't need to lock de.mu.
 func (de *endpoint) sendDiscoPing(ep epAddr, discoKey key.DiscoPublic, txid stun.TxID, size int, logLevel discoLogLevel) {
+	de.sendDiscoPingPolicy(ep, discoKey, txid, size, logLevel, de.c.pathGeneration())
+}
+func (de *endpoint) sendDiscoPingPolicy(ep epAddr, discoKey key.DiscoPublic, txid stun.TxID, size int, logLevel discoLogLevel, generation uint64) {
+	var relaySession uint64
+	if de.c.pathEnabled() {
+		de.mu.Lock()
+		sp, ok := de.sentPing[txid]
+		valid := ok && de.validPolicyPing(sp)
+		relaySession = sp.policyRelaySession
+		de.mu.Unlock()
+		if !valid {
+			return
+		}
+	}
 	size = min(size, MaxDiscoPingSize)
 	padding := max(size-discoPingSize, 0)
 
-	sent, _ := de.c.sendDiscoMessage(ep, de.publicKey, discoKey, &disco.Ping{
+	sent, _ := de.c.sendDiscoMessagePolicy(ep, de.publicKey, discoKey, &disco.Ping{
 		TxID:    [12]byte(txid),
 		NodeKey: de.c.publicKeyAtomic.Load(),
 		Padding: padding,
-	}, logLevel)
+	}, logLevel, pathSendContext{peer: de.publicKey, generation: generation, purpose: featurepolicy.PathProbe, relaySession: relaySession})
 	if !sent {
 		de.forgetDiscoPing(txid)
 		return
@@ -1297,6 +1393,18 @@ const (
 // is interested in the result (such as a CLI "tailscale ping" or a c2n ping
 // request, etc)
 func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose discoPingPurpose, size int, resCB *pingResultAndCallback) {
+	generation := de.c.pathGeneration()
+	if !de.c.decidePath(de.publicKey, pathOf(ep), featurepolicy.PathProbe, generation) {
+		return
+	}
+	var relaySession uint64
+	if peer := de.c.pathPeer(de.publicKey); peer != nil && ep.vni.IsSet() {
+		binding := peer.relay.Load()
+		if binding == nil || binding.source != ep {
+			return
+		}
+		relaySession = binding.session
+	}
 	if runtime.GOOS == "js" {
 		return
 	}
@@ -1307,7 +1415,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if epDisco == nil {
 		return
 	}
-	if purpose != pingCLI &&
+	if purpose != pingCLI && ep.ap.Addr() != tailcfg.DerpMagicIPAddr &&
 		!ep.vni.IsSet() { // de.endpointState is only relevant for direct/non-vni epAddr's
 		st, ok := de.endpointState[ep.ap]
 		if !ok {
@@ -1325,7 +1433,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 
 	// Default to sending a single ping of the specified size
 	sizes := []int{size}
-	if de.c.PeerMTUEnabled() {
+	if de.c.PeerMTUEnabled() && de.c.pathPeer(de.publicKey) == nil {
 		isDerp := ep.ap.Addr() == tailcfg.DerpMagicIPAddr
 		if !isDerp && ((purpose == pingDiscovery) || (purpose == pingCLI && size == 0)) {
 			de.c.dlogf("[v1] magicsock: starting MTU probe")
@@ -1346,18 +1454,24 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	de.lastSendAny = now
 	for _, s := range sizes {
 		txid := stun.NewTxID()
+		timeout := pingTimeoutDuration
+		if de.c.pathPeer(de.publicKey) != nil {
+			timeout = time.Duration(de.c.pathTimeoutSeconds.Load()) * time.Second
+		}
 		de.sentPing[txid] = sentPing{
-			to:      ep,
-			at:      now,
-			timer:   time.AfterFunc(pingTimeoutDuration, func() { de.discoPingTimeout(txid) }),
-			purpose: purpose,
-			resCB:   resCB,
-			size:    s,
+			policyGeneration:   generation,
+			policyRelaySession: relaySession,
+			to:                 ep,
+			at:                 now,
+			timer:              time.AfterFunc(timeout, func() { de.discoPingTimeout(txid) }),
+			purpose:            purpose,
+			resCB:              resCB,
+			size:               s,
 		}
 		if purpose == pingHeartbeatForUDPLifetime && de.probeUDPLifetime != nil {
 			de.probeUDPLifetime.lastTxID = txid
 		}
-		go de.sendDiscoPing(ep, epDisco.key, txid, s, logLevel)
+		go de.sendDiscoPingPolicy(ep, epDisco.key, txid, s, logLevel, generation)
 	}
 
 }
@@ -1365,6 +1479,10 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 // sendDiscoPingsLocked starts pinging all of ep's direct endpoints.
 // Sibling of discoverUDPRelayPathsLocked for udprelay.
 func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
+	de.policyProbeLocked(now)
+	if de.c.pathPeer(de.publicKey) != nil {
+		return
+	}
 	if debugNeverDirectUDP() {
 		return // skip when direct UDP is disabled
 	}
@@ -1398,7 +1516,7 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		// message to our peer via DERP informing them that we've
 		// sent so our firewall ports are probably open and now
 		// would be a good time for them to connect.
-		go de.c.enqueueCallMeMaybe(derpAddr, de)
+		go de.c.enqueueCallMeMaybePolicy(derpAddr, de, de.c.newPathSend(de.publicKey, featurepolicy.PathProbe))
 	}
 }
 
@@ -1427,17 +1545,23 @@ func (de *endpoint) sendWireGuardOnlyPingsLocked(now mono.Time) {
 			continue
 		}
 
-		go de.sendWireGuardOnlyPing(ipp, now)
+		go de.sendWireGuardOnlyPingPolicy(ipp, now, de.c.pathGeneration())
 	}
 }
 
 // sendWireGuardOnlyPing sends a ICMP ping to a WireGuard only address to
 // discover the latency.
 func (de *endpoint) sendWireGuardOnlyPing(ipp netip.AddrPort, now mono.Time) {
+	de.sendWireGuardOnlyPingPolicy(ipp, now, de.c.pathGeneration())
+}
+func (de *endpoint) sendWireGuardOnlyPingPolicy(ipp netip.AddrPort, now mono.Time, generation uint64) {
+	if !de.c.decidePath(de.publicKey, featurepolicy.Direct, featurepolicy.PathProbe, generation) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(de.c.connCtx, 5*time.Second)
 	defer cancel()
 
-	de.setLastPing(ipp, now)
+	de.setLastPingPolicy(ipp, now, generation)
 
 	addr := &net.IPAddr{
 		IP:   net.IP(ipp.Addr().AsSlice()),
@@ -1458,6 +1582,9 @@ func (de *endpoint) sendWireGuardOnlyPing(ipp netip.AddrPort, now mono.Time) {
 
 	de.mu.Lock()
 	defer de.mu.Unlock()
+	if !de.c.decidePath(de.publicKey, featurepolicy.Direct, featurepolicy.PathProbe, generation) {
+		return
+	}
 
 	state, ok := de.endpointState[ipp]
 	if !ok {
@@ -1473,8 +1600,14 @@ func (de *endpoint) sendWireGuardOnlyPing(ipp netip.AddrPort, now mono.Time) {
 
 // setLastPing sets lastPing on the endpointState to now.
 func (de *endpoint) setLastPing(ipp netip.AddrPort, now mono.Time) {
+	de.setLastPingPolicy(ipp, now, de.c.pathGeneration())
+}
+func (de *endpoint) setLastPingPolicy(ipp netip.AddrPort, now mono.Time, generation uint64) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
+	if !de.c.decidePath(de.publicKey, featurepolicy.Direct, featurepolicy.PathProbe, generation) {
+		return
+	}
 	state, ok := de.endpointState[ipp]
 	if !ok {
 		return
@@ -1732,6 +1865,35 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 		// This is not a pong for a ping we sent.
 		return false
 	}
+	if !de.validPolicyPing(sp) || !de.c.decidePath(de.publicKey, pathOf(src), featurepolicy.PathProbe, sp.policyGeneration) || (de.c.pathPeer(de.publicKey) != nil && (pathOf(src) != pathOf(sp.to) || src.vni.IsSet() && src != sp.to)) {
+		de.c.pathPolicy.Load().countDecision(de.publicKey, pathOf(src), 2, false)
+		return true
+	}
+	de.c.pathPolicy.Load().countDecision(de.publicKey, pathOf(src), 2, true)
+	de.c.pathPolicy.Load().countConfirmation(de.publicKey, pathOf(src), evidencePong)
+	de.observeProbeLocked(sp, true)
+	if src.vni.IsSet() && src == sp.to && sp.to == de.bestAddr.epAddr && de.bestAddr.policyRelayLifetime > 0 {
+		de.bestAddr.policyTrustUntil = mono.Now().Add(de.bestAddr.policyRelayLifetime)
+	}
+	if de.c.pathEnabled() && !isDerp {
+		de.c.pathPolicy.Load().countConfirmation(de.publicKey, pathOf(src), evidenceLastRecv)
+		de.lastRecvUDPAny.StoreAtomic(mono.Now())
+	}
+	if de.c.pathPeer(de.publicKey) != nil && !isDerp {
+		if de.policyCandidates == nil {
+			de.policyCandidates = map[featurepolicy.Path]addrQuality{}
+		}
+		candidate := de.policyCandidates[pathOf(src)]
+		candidate.epAddr = sp.to
+		candidate.latency = mono.Now().Sub(sp.at)
+		candidate.wireMTU = pingSizeToPktLen(sp.size, sp.to)
+		lifetime := trustUDPAddrDuration
+		if candidate.policyRelayLifetime > 0 {
+			lifetime = candidate.policyRelayLifetime
+		}
+		candidate.policyTrustUntil = mono.Now().Add(lifetime)
+		de.policyCandidates[pathOf(src)] = candidate
+	}
 	knownTxID = true // for naked returns below
 	de.removeSentDiscoPingLocked(m.TxID, sp, discoPongReceived)
 
@@ -1790,6 +1952,21 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			latency: latency,
 			wireMTU: pingSizeToPktLen(sp.size, sp.to),
 		}
+		if sp.to.vni.IsSet() {
+			previous := de.bestAddr
+			if candidate := de.policyCandidates[featurepolicy.PeerRelay]; candidate.epAddr == sp.to {
+				previous = candidate
+			}
+			if previous.epAddr == sp.to {
+				thisPong.relaySession = previous.relaySession
+				thisPong.relayServerDisco = previous.relayServerDisco
+				thisPong.policyRelayLifetime = previous.policyRelayLifetime
+				thisPong.policyGeneration = previous.policyGeneration
+				if previous.policyRelayLifetime > 0 {
+					thisPong.policyTrustUntil = now.Add(previous.policyRelayLifetime)
+				}
+			}
+		}
 		bestUntrusted := now.After(de.trustBestAddrUntil)
 		if betterAddr(thisPong, de.bestAddr) || bestUntrusted {
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
@@ -1839,6 +2016,11 @@ func (e epAddr) String() string {
 // addrQuality is an [epAddr], an optional [key.DiscoPublic] if a relay server
 // is associated, a round-trip latency measurement, and path mtu.
 type addrQuality struct {
+	policyRelayLifetime time.Duration
+	policyTrustUntil    mono.Time
+	policyGeneration    uint64
+	relaySession        uint64 // successful relay handshake generation; zero means unavailable
+
 	epAddr
 	relayServerDisco key.DiscoPublic // only relevant if epAddr.vni.isSet(), otherwise zero value
 	latency          time.Duration
@@ -1945,12 +2127,18 @@ func betterAddr(a, b addrQuality) bool {
 // already sent to us via UDP, so their stateful firewall should be
 // open. Now we can Ping back and make it through.
 func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
+	de.handleCallMeMaybePolicy(m, de.c.pathGeneration())
+}
+func (de *endpoint) handleCallMeMaybePolicy(m *disco.CallMeMaybe, generation uint64) {
 	if runtime.GOOS == "js" {
 		// Nothing to do on js/wasm if we can't send UDP packets anyway.
 		return
 	}
 	de.mu.Lock()
 	defer de.mu.Unlock()
+	if !de.c.decidePath(de.publicKey, featurepolicy.DERP, featurepolicy.PathProbe, generation) || !de.c.decidePath(de.publicKey, featurepolicy.Direct, featurepolicy.PathProbe, generation) {
+		return
+	}
 
 	now := time.Now()
 	for ep := range de.isCallMeMaybeEP {
@@ -2081,6 +2269,11 @@ func (de *endpoint) stopAndReset() {
 // DERP-only endpoint. It does not stop the endpoint's heartbeat
 // timer, if one is running.
 func (de *endpoint) resetLocked() {
+	if de.policyWGTimer != nil {
+		de.policyWGTimer.Stop()
+		de.policyWGTimer = nil
+	}
+	de.policyWGAttempt = 0
 	de.lastSendExt = 0
 	de.lastFullPing = 0
 	de.clearBestAddrLocked()
@@ -2110,5 +2303,13 @@ func (de *endpoint) setDERPHome(regionID uint16) {
 	de.derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))
 	if de.c.relayManager.hasPeerRelayServers.Load() {
 		de.c.relayManager.handleDERPHomeChange(de.publicKey, regionID)
+	}
+}
+
+func (de *endpoint) noteBadEndpointPolicy(addr epAddr, policy pathSendContext) {
+	de.c.mu.Lock()
+	defer de.c.mu.Unlock()
+	if de.c.allowPathSend(policy, pathOf(addr)) {
+		de.noteBadEndpoint(addr)
 	}
 }

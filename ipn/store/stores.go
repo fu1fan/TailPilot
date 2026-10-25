@@ -209,21 +209,39 @@ func (s *FileStore) ReadState(id ipn.StateKey) ([]byte, error) {
 
 // WriteState implements the StateStore interface.
 func (s *FileStore) WriteState(id ipn.StateKey, bs []byte) error {
+	return s.WriteStates(map[ipn.StateKey][]byte{id: bs})
+}
+
+// WriteStates atomically persists a group of keys, publishing the cache only
+// after the file replacement succeeds. Unrelated concurrent writes are retained.
+func (s *FileStore) WriteStates(updates map[ipn.StateKey][]byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if bytes.Equal(s.cache[id], bs) {
+	next := maps.Clone(s.cache)
+	changed := false
+	for k, v := range updates {
+		if bytes.Equal(next[k], v) {
+			continue
+		}
+		changed = true
+		if v == nil {
+			delete(next, k)
+		} else {
+			next[k] = bytes.Clone(v)
+		}
+	}
+	if !changed {
 		return nil
 	}
-	if bs == nil {
-		delete(s.cache, id)
-	} else {
-		s.cache[id] = bytes.Clone(bs)
-	}
-	bs, err := json.MarshalIndent(s.cache, "", "  ")
+	bs, err := json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	return atomicfile.WriteFile(s.path, bs, 0600)
+	if err = atomicfile.WriteFile(s.path, bs, 0600); err != nil {
+		return err
+	}
+	s.cache = next
+	return nil
 }
 
 func (s *FileStore) All() iter.Seq2[ipn.StateKey, []byte] {

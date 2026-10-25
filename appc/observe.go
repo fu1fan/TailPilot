@@ -6,6 +6,7 @@
 package appc
 
 import (
+	"fmt"
 	"net/netip"
 	"strings"
 
@@ -18,6 +19,40 @@ import (
 // matched against the configured domains, if matched the routeAdvertiser is
 // advised to advertise the discovered route.
 func (e *AppConnector) ObserveDNSResponse(res []byte) error {
+	return e.captureDNSObserver()(res)
+}
+
+// CaptureDNSObserver binds observations to the current lease sink and epoch.
+// A late response cannot attach its evidence to a replacement policy consumer.
+func (e *AppConnector) CaptureDNSObserver() func([]byte) error {
+	return e.captureDNSObserver()
+}
+
+func (e *AppConnector) captureDNSObserver() func([]byte) error {
+	e.mu.Lock()
+	epoch, sink := e.leaseEpoch.Load(), e.leaseSink.Load()
+	e.mu.Unlock()
+	return func(res []byte) error { return e.observeDNSResponseAt(res, epoch, sink) }
+}
+
+func (e *AppConnector) observeDNSResponseAt(res []byte, epoch uint64, sink *dnsLeaseSink) error {
+	if epoch != e.leaseEpoch.Load() {
+		return &LeaseObservationError{Err: fmt.Errorf("DNS observation crossed policy transition")}
+	}
+	if sink != nil {
+		observations, err := ParseLeaseDNS(res, sink.roots)
+		if err != nil {
+			return &LeaseObservationError{Err: err}
+		}
+		if len(observations) == 0 {
+			return nil
+		}
+		if err := sink.observe(observations); err != nil {
+			return &LeaseObservationError{Err: err}
+		}
+		return nil
+	}
+
 	var p dnsmessage.Parser
 	if _, err := p.Start(res); err != nil {
 		return err
@@ -104,6 +139,10 @@ func (e *AppConnector) ObserveDNSResponse(res []byte) error {
 	}
 
 	e.mu.Lock()
+	if epoch != e.leaseEpoch.Load() || e.leaseSink.Load() != nil {
+		e.mu.Unlock()
+		return &LeaseObservationError{Err: fmt.Errorf("DNS observation crossed policy transition")}
+	}
 	defer e.mu.Unlock()
 
 	for domain, addrs := range addressRecords {
@@ -129,4 +168,59 @@ func (e *AppConnector) ObserveDNSResponse(res []byte) error {
 		}
 	}
 	return nil
+}
+
+// CaptureDNSBatchObserver binds the same epoch as individual observations and
+// commits a bounded group of parsed lease observations in one transaction.
+// Parse errors are reported per reply and never poison unrelated queries.
+func (e *AppConnector) CaptureDNSBatchObserver() func([][]byte) []error {
+	e.mu.Lock()
+	epoch, sink := e.leaseEpoch.Load(), e.leaseSink.Load()
+	e.mu.Unlock()
+	return func(wires [][]byte) []error {
+		errs := make([]error, len(wires))
+		if sink == nil {
+			for i, w := range wires {
+				errs[i] = e.observeDNSResponseAt(w, epoch, sink)
+			}
+			return errs
+		}
+		if epoch != e.leaseEpoch.Load() {
+			for i := range errs {
+				errs[i] = &LeaseObservationError{Err: fmt.Errorf("DNS observation crossed policy transition")}
+			}
+			return errs
+		}
+		var all []DNSLeaseObservation
+		unique := map[DNSLeaseObservation]int{}
+		valid := make([]bool, len(wires))
+		for i, w := range wires {
+			obs, err := ParseLeaseDNS(w, sink.roots)
+			if err != nil {
+				errs[i] = &LeaseObservationError{Err: err}
+				continue
+			}
+			valid[i] = len(obs) > 0
+			for _, o := range obs {
+				k := o
+				k.TTL = 0
+				if index, ok := unique[k]; ok {
+					all[index].TTL = max(all[index].TTL, o.TTL)
+				} else {
+					unique[k] = len(all)
+					all = append(all, o)
+				}
+			}
+		}
+		if len(all) > 0 {
+			if err := sink.observe(all); err != nil {
+				for i := range errs {
+					if valid[i] {
+						errs[i] = &LeaseObservationError{Err: err}
+					}
+				}
+			}
+		}
+		return errs
+	}
 }

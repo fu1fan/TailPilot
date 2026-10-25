@@ -178,13 +178,16 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 	// permit some to have their action in a header.
 	var action string
 	switch v := r.Header.Get("Debug-Action"); v {
-	case "notify":
+	case "notify", "unified-policy-status", "unified-policy-preview", "unified-policy-reload", "unified-time-confirm", "unified-auto-clear-preview", "unified-auto-clear", "appc-route-reset-preview", "appc-route-reset", "appc-route-reset-rollback", "appc-route-adopt-preview", "appc-route-adopt":
 		action = v
 	default:
 		action = r.FormValue("action")
 	}
 	var err error
 	switch action {
+	case "unified-policy-status", "unified-policy-preview", "unified-policy-reload", "unified-time-confirm", "unified-auto-clear-preview", "unified-auto-clear", "appc-route-reset-preview", "appc-route-reset", "appc-route-reset-rollback", "appc-route-adopt-preview", "appc-route-adopt":
+		h.serveUnifiedPolicyDebug(w, r, action)
+		return
 	case "derp-set-homeless":
 		h.b.MagicConn().SetHomeless(true)
 	case "derp-unset-homeless":

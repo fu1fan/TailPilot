@@ -1,0 +1,85 @@
+{
+  "deploymentID": "dev-fixture-001",
+  "host": "isolated-dev",
+  "stableID": "fixtureStableID",
+  "releaseID": "1.102.3-unified.u1-fixture",
+  "releaseDirectory": "/fixture/release",
+  "releaseSHA256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "deadlineSeconds": 900,
+  "oobEvidence": "/fixture/oob.json",
+  "oobSHA256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "externalEvidence": "/fixture/e2e.json",
+  "externalSHA256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "backupFiles": {
+    "daemon": [
+      "/fixture/daemon"
+    ],
+    "cli": [
+      "/fixture/cli"
+    ],
+    "unit": [
+      "/fixture/unit"
+    ],
+    "dropins": [
+      "/fixture/dropins"
+    ],
+    "config": [
+      "/fixture/config"
+    ],
+    "prefs": [
+      "/fixture/prefs"
+    ],
+    "state": [
+      "/fixture/state"
+    ],
+    "routeinfo": [
+      "/fixture/routeinfo"
+    ],
+    "ledger": [
+      "/fixture/ledger"
+    ],
+    "routes": [
+      "/fixture/routes"
+    ],
+    "control": [
+      "/fixture/control"
+    ],
+    "updates": [
+      "/fixture/updates"
+    ]
+  },
+  "expectedBefore": {
+    "/fixture/daemon": "ABSENT",
+    "/fixture/cli": "ABSENT",
+    "/fixture/unit": "ABSENT",
+    "/fixture/dropins": "ABSENT",
+    "/fixture/config": "ABSENT",
+    "/fixture/prefs": "ABSENT",
+    "/fixture/state": "ABSENT",
+    "/fixture/routeinfo": "ABSENT",
+    "/fixture/ledger": "ABSENT",
+    "/fixture/routes": "ABSENT",
+    "/fixture/control": "ABSENT",
+    "/fixture/updates": "ABSENT",
+    "/fixture/defaults": "ABSENT"
+  },
+  "originalExecStart": "ExecStart=/usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=$PORT $FLAGS",
+  "environmentFiles": [
+    "/fixture/defaults"
+  ],
+  "configuration": "/fixture/config.json",
+  "configurationSHA256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "excludePeers": [
+    "management-fixture",
+    "codex-fixture"
+  ],
+  "excludeDomains": [
+    "management.example.invalid",
+    "codex.example.invalid"
+  ],
+  "cohort": "first",
+  "predecessorEvidence": "",
+  "autoUpdateCheck": true,
+  "autoUpdateApply": true,
+  "aptHeld": false
+}

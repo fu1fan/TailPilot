@@ -3443,7 +3443,9 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 	// asynchronous, resulting in a flaky test.
 	// Therefore, we set the netmap to nil to simulate a fresh backend start
 	// or a profile switch where the netmap is not yet available.
+	b.mu.Lock()
 	b.setNetMapLocked(nil)
+	b.mu.Unlock()
 	if err := b.Start(ipn.Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -3455,7 +3457,11 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Start launches the policy worker. The locked helper and its prefs read
+	// must share b.mu with the worker input capture (R12 race regression).
+	b.mu.Lock()
 	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
+	b.mu.Unlock()
 
 	// Smoke check that AdvertiseRoutes doesn't have the test IP.
 	ip := netip.MustParseAddr("1.2.3.4")

@@ -1,0 +1,13 @@
+# Reference for native.py arm(). Concrete units are generated locally.
+# @RECOVERY_ARGV@ is /usr/bin/python3 <private txn>/native.py --internal boot --transaction <private txn>.
+[Unit]
+Description=Unified local boot recovery
+After=local-fs.target
+Before=tailscaled.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=180
+ExecStart=@RECOVERY_ARGV@
+# Dependency is installed separately in tailscaled.service.d/89-unified-recovery.conf.
+# No synchronous tailscaled start from this ordered-before unit.

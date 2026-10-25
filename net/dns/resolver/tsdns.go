@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	dns "golang.org/x/net/dns/dnsmessage"
@@ -460,6 +461,44 @@ func parseExitNodeQuery(q []byte) *response {
 	return p.response()
 }
 
+// peerDNSUpstreams decides whether the OS stub nameserver is safe to use as an
+// explicit upstream for peer/exit-node DNS forwarding.
+//
+// systemd-resolved's well-known stub addresses (127.0.0.53 and 127.0.0.54) are
+// special: Tailscale programs resolved link DNS routes for tailnet split-DNS
+// domains, so forwarding to the stub can re-enter the local tailscale0 routes
+// and loop back into this node's own PeerAPI. Those two addresses are bypassed
+// so the forwarder uses the node's configured upstreams instead. Other loopback
+// stubs (for example a dnsmasq on 127.0.0.1) are not programmed by Tailscale's
+// resolved integration and keep the historical explicit-upstream behavior.
+func peerDNSUpstreams(nameserver netip.Addr) (resolvers []resolverAndDelay, bypassedStub bool) {
+	switch nameserver {
+	case tsaddr.TailscaleServiceIP(), tsaddr.TailscaleServiceIPv6():
+		// If resolv.conf says 100.100.100.100, it's coming right back to us anyway
+		// so avoid the loop through the kernel and just do what we
+		// would've done anyway. By not passing any resolvers, the forwarder
+		// will use its default ones from our DNS config.
+		return nil, false
+	case netip.Addr{}:
+		// Likewise, if the platform has no resolv.conf, just use our defaults.
+		return nil, false
+	}
+	if isResolvedStubAddr(nameserver) {
+		// Not self-referential, but resolved may route these names back through
+		// tailscale0 match domains. Use configured upstreams instead.
+		return nil, true
+	}
+	return []resolverAndDelay{{
+		name: &dnstype.Resolver{Addr: net.JoinHostPort(nameserver.String(), "53")},
+	}}, false
+}
+
+// isResolvedStubAddr reports systemd-resolved's well-known loopback stub
+// addresses. Only these are bypassed; see peerDNSUpstreams for why.
+func isResolvedStubAddr(ip netip.Addr) bool {
+	return ip == netip.AddrFrom4([4]byte{127, 0, 0, 53}) || ip == netip.AddrFrom4([4]byte{127, 0, 0, 54})
+}
+
 // HandlePeerDNSQuery handles a DNS query that arrived from a peer
 // via the peerapi's DoH server. This is used when the local
 // node is being an exit node or an app connector.
@@ -508,19 +547,13 @@ func (r *Resolver) HandlePeerDNSQuery(ctx context.Context, q []byte, from netip.
 		}
 		// TODO: more than 1 resolver from /etc/resolv.conf?
 
-		var resolvers []resolverAndDelay
-		switch nameserver {
-		case tsaddr.TailscaleServiceIP(), tsaddr.TailscaleServiceIPv6():
-			// If resolv.conf says 100.100.100.100, it's coming right back to us anyway
-			// so avoid the loop through the kernel and just do what we
-			// would've done anyway. By not passing any resolvers, the forwarder
-			// will use its default ones from our DNS config.
-		case netip.Addr{}:
-			// Likewise, if the platform has no resolv.conf, just use our defaults.
-		default:
-			resolvers = []resolverAndDelay{{
-				name: &dnstype.Resolver{Addr: net.JoinHostPort(nameserver.String(), "53")},
-			}}
+		resolvers, bypassedStub := peerDNSUpstreams(nameserver)
+		if bypassedStub {
+			metricDNSExitProxyLoopbackStub.Add(1)
+			// Log once per process: queries are frequent and the fact is static.
+			if peerDNSLoopbackLogged.CompareAndSwap(false, true) {
+				r.logf("exit node DNS: loopback stub resolver %v not used as an upstream; using configured upstreams", nameserver)
+			}
 		}
 
 		err = r.forwarder.forwardWithDestChan(ctx, packet{q, "tcp", from}, ch, resolvers...)
@@ -541,6 +574,10 @@ func (r *Resolver) HandlePeerDNSQuery(ctx context.Context, q []byte, from netip.
 }
 
 var debugExitNodeDNSNetPkg = envknob.RegisterBool("TS_DEBUG_EXIT_NODE_DNS_NET_PKG")
+
+// peerDNSLoopbackLogged limits the one-line loopback-stub diagnostic to the
+// first bypass in this process.
+var peerDNSLoopbackLogged atomic.Bool
 
 // handleExitNodeDNSQueryWithNetPkg takes a DNS query message in q and
 // return a reply (for the ExitDNS DoH service) using the net package's
@@ -1543,6 +1580,7 @@ var (
 	metricDNSExitProxyErrorName       = clientmetric.NewCounter("dns_exit_node_error_name")
 	metricDNSExitProxyErrorForward    = clientmetric.NewCounter("dns_exit_node_error_forward")
 	metricDNSExitProxyErrorResolvConf = clientmetric.NewCounter("dns_exit_node_error_resolvconf")
+	metricDNSExitProxyLoopbackStub    = clientmetric.NewCounter("dns_exit_node_loopback_stub")
 
 	metricDNSFwd                     = clientmetric.NewCounter("dns_query_fwd")
 	metricDNSFwdDropBonjour          = clientmetric.NewCounter("dns_query_fwd_drop_bonjour")

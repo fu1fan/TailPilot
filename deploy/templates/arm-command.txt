@@ -1,0 +1,11 @@
+Reference for native.py; never shell-evaluate this file.
+Under host.lock, fsync pending journal and bootID/monotonicDeadline/wallDeadline.
+Install persistent recovery unit and tailscaled Requires/After guard; daemon-reload.
+Start recovery unit (same-boot no-op, avoids lock recursion).
+systemd-run --unit=unified-<deploymentID>-rollback --on-active=<seconds>s
+  --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=180s
+  /usr/bin/python3 /var/lib/tailscale-unified-deploy/<deploymentID>/native.py
+  --internal rollback --transaction /var/lib/tailscale-unified-deploy/<deploymentID>
+Record systemctl timer/ExecStart/guard readback and payload hashes before armed.
+Pending on reboot restores original service before tailscaled is allowed to start.
+Commit writes durable committed before timer stop; cleanup removes dormant boot guard.
