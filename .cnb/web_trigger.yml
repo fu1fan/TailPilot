@@ -1,0 +1,8 @@
+branch:
+  - buttons:
+      - name: 用户态压测（15 分钟）
+        description: 冷启动、突发 DNS 查询和租约稳定性；不测试内核路由
+        event: web_trigger_stress
+      - name: 构建候选包
+        description: 双次构建核对 amd64 与 arm64；不部署生产
+        event: web_trigger_release

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""R3 scale acceptance: real daemon, 1 vCPU quota, 24xx routes / 63x domains.
+"""Scale acceptance: real daemons, 24xx routes / 63x domains.
+
+TAILPILOT_USERSPACE=1 runs without TUN/systemd in a disposable container.
+The native mode below retains its original isolated namespace/quota contract.
 
 Runs in a run-owned systemd private network/mount namespace. Reuses the cli810
 helper prefix (root/bin/state/sock/save/command/cli/start/stop/until) and adds a
@@ -16,6 +19,12 @@ import threading
 import http.client
 import queue
 from urllib.parse import urlsplit
+import signal
+
+def interrupted(signum, frame):
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGTERM, interrupted)
 
 # --- reviewed scale profile (residential production shape) -------------------
 DOMAINS = int(os.environ.get('R33_SCALE_DOMAINS', '632'))   # + *.example.test = 633
@@ -33,7 +42,8 @@ NAME_COUNT = int(os.environ.get('R33_SCALE_NAMES', '64'))
 NAMES = ['q%d.d%d.example.test' % (i, i % max(1, min(16, DOMAINS))) for i in range(NAME_COUNT)]
 SEED_LEASES = int(os.environ.get('R33_SCALE_SEED_LEASES', '124'))
 COLD = os.environ.get('R4_COLD', '0') == '1'
-unit_props = ('CPUQuota=100%', 'MemoryMax=913M', 'MemorySwapMax=0')
+USERSPACE = os.environ.get('TAILPILOT_USERSPACE') == '1'
+unit_props = () if USERSPACE else ('CPUQuota=100%', 'MemoryMax=913M', 'MemorySwapMax=0')
 
 
 def until(fn, label, timeout=30):
@@ -56,6 +66,17 @@ class DaemonService:
         DaemonService.serial += 1
         self.unit = f'r3-scale-daemon-{os.getpid()}-{DaemonService.serial}.service'
         self.returncode = None
+        self.proc = None
+        if USERSPACE:
+            env = dict(os.environ, TS_UNIFIED_POLICY_FILE=str(policy),
+                       TS_NO_LOGS_NO_SUPPORT='true', TS_ASSUME_NETWORK_UP_FOR_TEST='true')
+            self.proc = start([str(bin / 'tailscaled'), '--tun=userspace-networking',
+                               '--state=' + str(state), '--socket=' + str(sock),
+                               '--port=0', '--statedir=' + str(root / 'daemon')],
+                              self.unit + '.log', env)
+            self.pid = self.proc.pid
+            save(self.unit + '.json', {'pid': self.pid, 'mode': 'userspace-networking'})
+            return
         parent = os.environ['R33_PARENT_UNIT']
         argv = ['systemd-run', '--unit=' + self.unit, '--property=Type=exec',
                 '--property=PrivateNetwork=yes', '--property=JoinsNamespaceOf=' + parent,
@@ -77,6 +98,8 @@ class DaemonService:
         save(self.unit + '.json', {'unit': self.unit, 'pid': self.pid, 'parent': parent,
                                    'cpu_quota': '100%', 'memory_max': '913M'})
     def poll(self):
+        if self.proc is not None:
+            return self.proc.poll()
         if self.returncode is not None:
             return self.returncode
         data = subprocess.check_output(['systemctl', 'show', self.unit, '-p', 'ActiveState',
@@ -89,11 +112,27 @@ class DaemonService:
         save(self.unit + '-exit.json', props)
         return self.returncode
     def terminate(self):
+        if self.proc is not None:
+            stop(self.proc)
+            return
         subprocess.run(['systemctl', 'stop', self.unit], check=True, capture_output=True)
     def wait(self, timeout=10):
+        if self.proc is not None:
+            return self.proc.wait(timeout=timeout)
         subprocess.run(['systemctl', 'stop', self.unit], capture_output=True)
         return self.poll()
+    def kill(self):
+        if self.proc is not None:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+        else:
+            command(['systemctl', 'kill', '--signal=SIGKILL', self.unit])
+
     def archive(self):
+        if self.proc is not None:
+            stop(self.proc)
+            save(self.unit + '-exit.json', {'returncode': self.proc.returncode})
+            return
         (root / (self.unit + '.log')).write_bytes(
             subprocess.check_output(['journalctl', '-u', self.unit, '--no-pager']))
         subprocess.run(['systemctl', 'stop', self.unit], capture_output=True)
@@ -105,10 +144,12 @@ class DNSServer:
 
     def __init__(self):
         self.sockets = []
+        self.port = 53
         for typ in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
             s = socket.socket(socket.AF_INET, typ)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(('127.0.0.1', 53))
+            s.bind(('127.0.0.1', self.port))
+            self.port = s.getsockname()[1]
             self.sockets.append(s)
             if typ == socket.SOCK_STREAM:
                 s.listen(64)
@@ -430,19 +471,26 @@ def sampler():
 
 try:
     assert DOMAINS >= 0 and ROUTES >= 0 and SECONDS >= 60
-    assert os.readlink('/proc/self/ns/net') != os.readlink('/proc/1/ns/net')
+    if not USERSPACE:
+        assert os.readlink('/proc/self/ns/net') != os.readlink('/proc/1/ns/net')
+        assert Path('/etc/resolv.conf').read_text() == 'nameserver 127.0.0.1\n'
     assert Path('/etc/resolv.conf').read_text() == 'nameserver 127.0.0.1\n'
     save('scope.json', {'netns': os.readlink('/proc/self/ns/net'), 'mountns': os.readlink('/proc/self/ns/mnt'),
                         'profile': {'domains_total': DOMAINS + 1, 'routes_total': ROUTES + 1,
                                     'seconds': SECONDS, 'rate': RATE, 'workers': WORKERS,
                                     'burst_every': BURST_EVERY, 'burst_n': BURST_N},
-                        'unit_props': list(unit_props), 'http_connection_reuse': HTTP_REUSE})
+                        'unit_props': list(unit_props), 'userspace': USERSPACE,
+                        'cpu_affinity_count': len(os.sched_getaffinity(0)),
+                        'cgroup': {n: (Path('/sys/fs/cgroup') / n).read_text().strip() for n in ['cpu.max', 'memory.max'] if (Path('/sys/fs/cgroup') / n).exists()},
+                        'http_connection_reuse': HTTP_REUSE,
+                        'uid': os.getuid(),
+                        'capabilities': [line for line in Path('/proc/self/status').read_text().splitlines() if line.startswith(('CapEff:', 'CapBnd:', 'NoNewPrivs:'))]})
     phase='startup'
     dns = DNSServer()
     save('policy.json', {'schema_version': 2, 'enabled': False})
     ctl = start([str(bin / 'control'), '--bind=127.0.0.1', '--appc-fixture',
                  '--appc-domains', str(DOMAINS), '--appc-routes', str(ROUTES),
-                 '--dns-resolver=127.0.0.1:53'], 'control.log', stdout=subprocess.PIPE)
+                 '--dns-resolver=127.0.0.1:' + str(dns.port)], 'control.log', stdout=subprocess.PIPE)
     assert select.select([ctl.stdout], [], [], 20)[0]
     info = json.loads(ctl.stdout.readline())
     save('control.json', info)
@@ -507,7 +555,7 @@ try:
         fresh_name='fresh.d0.example.test'
         fresh_ip='192.0.2.%d/32' % (int(hashlib.sha256(fresh_name.encode()).hexdigest()[:8],16)%250+1)
         doh_retry(fresh_name)
-        command(['systemctl','kill','--signal=SIGKILL',daemon_svc.unit])
+        daemon_svc.kill()
         daemon_svc.archive()
         daemon_svc=DaemonService()
         running()
@@ -580,7 +628,7 @@ try:
         expected={ipv6_route(name) for name in names}
         routes=set(cli('debug','prefs').get('AdvertiseRoutes') or [])
         assert expected <= routes, ('missing IPv6 routes',expected-routes)
-        command(['systemctl','kill','--signal=SIGKILL',daemon_svc.unit])
+        daemon_svc.kill()
         daemon_svc.archive()
         daemon_svc=DaemonService()
         running()
@@ -687,12 +735,26 @@ try:
               and acceptance['client_other'] == 0 and exceptions == 0
               and acceptance['degraded_ratio'] <= 0.001 and len(samples) >= 60
               and lease_stable)
+    if USERSPACE:
+        # Distinguish isolated request loss from invariant/storage failures.
+        total = ok + servfail + other + exceptions
+        allowance = max(1, int(total * 0.001))
+        acceptance.update(error_allowance=allowance, queries=total,
+                          error_ratio=(servfail + other + exceptions) / max(1, total))
+        passed = (total > 0 and servfail + other + exceptions <= allowance
+                  and max(acceptance['queue_deadline_delta'], acceptance['queue_full_delta'],
+                          acceptance['failure_delta']) <= allowance
+                  and acceptance['storage_delta'] == 0
+                  and acceptance['observe_error_delta'] == 0
+                  and acceptance['stale_capture_final_delta'] == 0
+                  and acceptance['degraded_ratio'] <= 0.001
+                  and len(samples) >= 60 and lease_stable)
     save('scale-acceptance.json', acceptance)
-    gates['scale_15min_1vcpu'] = 'PASS' if passed else 'FAIL'
+    gates['userspace_scale' if USERSPACE else 'scale_15min_1vcpu'] = 'PASS' if passed else 'FAIL'
     save('result.json', {'result': 'PASS' if passed else 'FAIL', 'gates': gates,
                          'acceptance': acceptance, 'errors': errors,
-                         'scope': 'real Linux daemon in private netns; CPUQuota=100% MemoryMax=913M; '
-                                  'one vCPU worth; synthetic control/DNS fixture; not production'})
+                         'scope': ('userspace daemons; observed CNB/container resources; no kernel routing claim' if USERSPACE else 'real Linux daemon in private netns; CPUQuota=100% MemoryMax=913M; ')
+                                  + '; synthetic control/DNS fixture; not production'})
     if not passed:
         raise RuntimeError(('scale acceptance failed', acceptance))
 except Exception as e:

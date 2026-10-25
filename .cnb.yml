@@ -1,0 +1,81 @@
+# Schema: https://docs.cnb.cool/zh/build/grammar.html
+"**":
+  push:
+    - &verify
+      name: TailPilot userspace verification
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 4
+      docker:
+        build: .ide/Dockerfile
+      env:
+        GOTOOLCHAIN: local
+        GOWORK: "off"
+        TAILPILOT_DISPOSABLE_CONTAINER: "1"
+      stages:
+        - name: Race tests
+          script: bash .ci/test.sh
+          timeout: 1200s
+        - name: Build fork and stock client
+          script: bash .ci/build.sh
+          timeout: 1200s
+        - name: DNS filtering and route reset restart checks
+          script: bash .ci/run-lab.sh smoke
+          timeout: 1500s
+        - name: Upload safe summaries
+          image: cnbcool/attachments:latest
+          settings:
+            attachments: .artifacts/*.tar.gz
+            ttl: 30
+  pull_request:
+    - *verify
+  api_trigger_verify:
+    - *verify
+  web_trigger_stress:
+    - name: TailPilot cold start and burst load
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 4
+      docker:
+        build: .ide/Dockerfile
+      env:
+        TAILPILOT_DISPOSABLE_CONTAINER: "1"
+      stages:
+        - name: Build test binaries
+          script: bash .ci/build.sh
+          timeout: 1200s
+        - name: Fifteen minute userspace pressure test
+          script: bash .ci/run-lab.sh stress
+          timeout: 1500s
+        - name: Upload safe summaries
+          image: cnbcool/attachments:latest
+          settings:
+            commit: $CNB_COMMIT
+            attachments: .artifacts/*.tar.gz
+            ttl: 30
+  web_trigger_release:
+    - name: Reproducible candidate build only
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 8
+      docker:
+        build: .ide/Dockerfile
+      stages:
+        - name: Build amd64 and arm64 twice and compare
+          script: bash .ci/release.sh
+          timeout: 3600s
+        - name: Upload candidate package to commit
+          image: cnbcool/attachments:latest
+          settings:
+            commit: $CNB_COMMIT
+            attachments: .artifacts/*
+            ttl: 30
+$:
+  vscode:
+    - docker:
+        build: .ide/Dockerfile
+      services:
+        - vscode
+      stages:
+        - name: Environment
+          script: go version

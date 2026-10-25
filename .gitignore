@@ -64,3 +64,6 @@ gafpush
 # local test byproducts (never part of a reviewed checkout)
 __pycache__/
 *.pyc
+
+# CNB generated artifacts (never include runtime state).
+.artifacts/

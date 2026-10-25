@@ -8,8 +8,7 @@ public snapshot is based on Tailscale v1.102.3 and the R6 implementation.
 Private operational history and deployment evidence are not included.
 Original upstream licensing and attribution are retained below and in LICENSE.
 
-Development and unprivileged CNB testing are being migrated in the CNB workflow
-branch. Production deployment always requires an explicit operator action;
+Development, userspace tests and candidate builds use the [CNB workflow](docs/CNB.md). Production deployment always requires an explicit operator action;
 ordinary pushes must never modify a tailnet or a production host.
 
 ---
