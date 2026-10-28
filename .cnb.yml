@@ -27,6 +27,30 @@
           settings:
             attachments: .artifacts/*.tar.gz
             ttl: 30
+    - name: Sync to GitHub
+      stages:
+        - name: Configure GitHub SSH on port 443
+          script: git config core.sshCommand 'ssh -o UserKnownHostsFile=/workspace/.cnb/github-known-hosts -o StrictHostKeyChecking=yes -o ConnectTimeout=30'
+        - name: Sync current branch and tags
+          image: tencentcom/git-sync
+          settingsFrom:
+            - https://cnb.cool/fu1fan/secrets/-/blob/main/tailpilot-github-sync.yml
+          settings:
+            target_url: ssh://git@ssh.github.com:443/fu1fan/TailPilot.git
+            branch: ${CNB_BRANCH}
+            push_tags: true
+  tag_push:
+    - name: Sync tags to GitHub
+      stages:
+        - name: Configure GitHub SSH on port 443
+          script: git config core.sshCommand 'ssh -o UserKnownHostsFile=/workspace/.cnb/github-known-hosts -o StrictHostKeyChecking=yes -o ConnectTimeout=30'
+        - name: Sync tags
+          image: tencentcom/git-sync
+          settingsFrom:
+            - https://cnb.cool/fu1fan/secrets/-/blob/main/tailpilot-github-sync.yml
+          settings:
+            target_url: ssh://git@ssh.github.com:443/fu1fan/TailPilot.git
+            push_tags: true
   pull_request:
     - *verify
   api_trigger_verify:
